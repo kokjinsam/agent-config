@@ -1,0 +1,23 @@
+{
+  "name": "@kokjinsam/agent-config",
+  "version": "1.0.0",
+  "description": "Pi coding agent commands, skills, extensions, and themes",
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "diff": "^8.0.4"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kokjinsam/agent-stuff.git"
+  },
+  "pi": {
+    "extensions": ["./pi-extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./commands"]
+  }
+}
