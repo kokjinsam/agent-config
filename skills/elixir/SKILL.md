@@ -283,6 +283,86 @@ when constructing the struct, before piping into `change/2`:
 `seeds.exs` runs as a script and doesn't inherit module imports. Add
 `import Ecto.Query` and aliases at the top if you use them.
 
+# External I/O & Oban
+
+Synchronous external calls are expensive in latency, fragile under failure,
+and dangerous inside a database transaction. Default to **not making them
+in the request path**, and when you do, treat them as the failure-prone
+resources they are.
+
+## Synchronous external calls
+
+When a synchronous call is genuinely the right shape (a read whose result
+must be in the response), wrap it with discipline:
+
+- **Short timeouts.** A 30-second default will eventually pin a process
+  while the rest of the system queues up behind it.
+- **Bounded retries with backoff.** Retry transient failures, but cap
+  attempts. Reach for [`retry`](https://github.com/safwank/ElixirRetry)
+  (the `:retry` hex package) for composable retry/backoff rather than
+  rolling your own loop.
+- **Fallbacks.** Know what the system does when the call fails — return a
+  stale cached value, degrade the feature, surface a partial error.
+- **Caching.** If the upstream tolerates it, cache responses so transient
+  outages and rate limits don't propagate.
+- **Idempotency.** Assume any external write may be retried. Send an
+  idempotency key the upstream understands, or design the request so
+  duplicates are safe.
+
+## Don't perform external I/O inside a DB transaction
+
+Wrapping a `Repo.transaction` around code that calls Stripe, sends an
+email, or posts a webhook is almost always wrong: the external system
+commits at network latency while the DB transaction holds row locks, and
+failures leave the DB rolled back but the external side effect already
+fired. `Phoenix.PubSub` broadcasts have the same shape — subscribers can
+react to data that later rolls back — so they belong post-commit too.
+
+External I/O belongs **outside** the transaction, after it commits. Do it
+inside only when you have a very deliberate reason and a documented
+compensation story.
+
+## Oban is the reliable post-commit mechanism
+
+Don't think of Oban as "just background jobs." It is the mechanism by
+which a context guarantees that a side effect runs **if and only if** the
+DB change committed. The pattern is `Ecto.Multi` + `Oban.insert`:
+
+    Multi.new()
+    |> Multi.insert(:order, Order.changeset(%Order{}, attrs))
+    |> Oban.insert(:notify, fn %{order: order} ->
+      SendOrderEmail.new(%{order_id: order.id})
+    end)
+    |> Repo.transaction()
+
+The job row is inserted in the same transaction as the order. If the
+transaction rolls back, the job is rolled back with it and never runs. If
+it commits, Oban picks the job up. There is no window where the email is
+sent for an order that doesn't exist, and no window where the order
+exists but the email is silently lost.
+
+Enqueueing **after** `Repo.transaction/1` returns is an anti-pattern: a
+crash between the transaction and the enqueue drops the side effect.
+
+## Email goes through Oban
+
+`Swoosh.deliver/1` called straight from a controller, LiveView event, or
+context function is the canonical mistake. It makes the SMTP round-trip
+part of the user's request, and inside a transaction it pins a DB
+connection while talking to the mail provider. Wrap delivery in an Oban
+worker and enqueue it through `Multi` as above. The same applies to
+webhooks, payment gateways, push notifications, audit-log shipping, data
+exports, and any third-party API call triggered by a state change.
+
+## Workers must be idempotent
+
+Oban retries — on crashes, timeouts, deploys, and transient errors. Any
+worker that produces a side effect has to be safe to run more than once
+for the same input. The mechanism varies (unique jobs, idempotency keys
+stored on the row, upsert-on-conflict, a dedup check against the
+upstream), so pick what fits the side effect — but design every worker
+assuming a second run is coming.
+
 # Phoenix HTML / HEEx
 
 Phoenix templates use **HEEx** — `~H` sigils or `.html.heex` files. The

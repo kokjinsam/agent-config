@@ -79,16 +79,87 @@ Checkout.get_cart(scope, cart_id)
 BackgroundCalls.get_dialer(scope, agent_id)
 ```
 
-### Scope is first-class
+### Scope is the access-control boundary
 
-Every public command and query takes a `scope` as the first parameter — this is Phoenix's built-in
-tenant/workspace scoping mechanism. Scope flows visibly through every API boundary, with repo-level
-enforcement as a fallback.
+Every context function whose result or side effect depends on the current user, organization,
+tenant, permissions, request actor, or visibility must take a `%Scope{}` as its **first** argument.
+This is the same pattern `mix phx.gen.live` produces — generated context functions thread
+`current_scope` through and filter queries by `scope.user.id` (or `scope.organization.id`, etc.)
+at the data layer. Broken access control is one of the most common security failures in Phoenix
+apps; making the scope visible in every signature is how you keep it from drifting.
+
+Pattern match the struct in the head so a missing or malformed scope fails fast at the call site:
 
 ```elixir
-Checkout.place_order(scope, cart_id)
-Billing.get_invoice(scope, invoice_id)
+# Scoped query
+def list_projects(%Scope{} = scope) do
+  Project
+  |> where([p], p.org_id == ^scope.organization.id)
+  |> Repo.all()
+end
+
+# Scoped lookup
+def get_project!(%Scope{} = scope, id) do
+  Project
+  |> where([p], p.org_id == ^scope.organization.id)
+  |> Repo.get!(id)
+end
+
+# Scoped mutation — programmatic fields come from scope, never from params
+def create_project(%Scope{} = scope, attrs) do
+  %Project{org_id: scope.organization.id, created_by_id: scope.user.id}
+  |> Project.changeset(attrs)
+  |> Repo.insert()
+end
 ```
+
+The point isn't bureaucracy — it's that **unsafe code starts looking suspicious at a glance**.
+This should feel wrong:
+
+```elixir
+Blog.get_post!(id)
+```
+
+while this advertises the access boundary:
+
+```elixir
+Blog.get_post!(scope, id)
+```
+
+Reviewing a PR or grepping a callsite, you can tell which functions enforce a boundary and which
+don't without reading the implementation.
+
+In LiveViews, scope comes from `socket.assigns.current_scope`; in controllers, from
+`conn.assigns.current_scope`. Both are set up by the authentication plug and `on_mount` callbacks
+that `mix phx.gen.auth` generates — the context function never builds a scope itself.
+
+#### When scope is _not_ required
+
+Some functions are genuinely global, pure, or run before a scope exists. They don't need one,
+but they should advertise that fact:
+
+```elixir
+# Pure helper — no access boundary to enforce
+def normalize_email(email), do: ...
+
+# Authentication bootstrap — runs before a scope exists
+def get_user_by_email(email), do: ...
+
+# System/background operation — name it so the bypass is visible
+def system_recalculate_usage(project_id), do: ...
+
+# Admin surface with its own permissions — separate scope struct
+def admin_list_projects(%AdminScope{} = scope), do: ...
+```
+
+A `system_` / `admin_` prefix, or a dedicated `%AdminScope{}` / `%SystemScope{}` struct in the
+first-arg position — either is fine. Both make it obvious in review and grep that "no user scope"
+was a deliberate choice, not an oversight. Choose by feel: prefix for one-off internal helpers,
+a dedicated scope struct when there's a real admin surface with its own permission model.
+
+The cast rule from the elixir skill (don't `cast` programmatic fields like `user_id`, `org_id`,
+`created_by`) reinforces this: those fields come from `scope`, never from params. Together they
+close the most common access-control gap in Phoenix apps.
 
 ### Command return shapes
 
@@ -224,14 +295,6 @@ end
 - **Aggregates:** unit test only when the business logic is complex enough to warrant it.
 - Never test internal schemas, repositories, or changesets directly.
 
-## LiveView
-
-Treat LiveView as a pure UI layer — it calls context commands and queries exactly like a controller would. No special DDD guidance needed.
-
-## Ecto.Multi
-
-Mention as an option for multi-step writes within a single context that must be atomic. Don't make it the default recommendation.
-
 ---
 
 ## Anti-patterns to flag proactively
@@ -243,7 +306,7 @@ Mention as an option for multi-step writes within a single context that must be 
 5. **Events as commands** — `SendEmail`, `ChargeCard`, `UpdateTask`
 6. **Internal coupling** — calling `Repo`, `Changeset`, or internal schemas from another context
 7. **Overengineering CRUD** — adding aggregates and events when simple Phoenix/Ecto is enough
-8. **Missing scope** — public commands/queries without a `scope` parameter in a multi-tenant app
+8. **Missing scope** — public commands/queries that touch user/org-owned data without a `%Scope{}` first argument, or unscoped functions that don't advertise the bypass with a `system_` / `admin_` prefix
 
 ---
 
