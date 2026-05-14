@@ -1,5 +1,5 @@
 ---
-name: ddd-phoenix
+name: ddd-elixir
 description: >
   Pragmatic Domain-Driven Design for Phoenix/Elixir applications. Use this skill when the user asks
   about Phoenix context design, naming, modeling, or architecture — even if they don't say "DDD" or

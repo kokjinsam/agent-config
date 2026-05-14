@@ -1,5 +1,5 @@
 ---
-name: elixir-phoenix
+name: elixir
 description: >
   Phoenix v1.8+ and Elixir conventions, gotchas, and patterns for writing
   code that compiles and behaves correctly. Use this skill whenever the user
@@ -13,7 +13,7 @@ description: >
   routing, LiveView streams, LiveView JS hooks, Ecto preloading, form
   handling, and Elixir standard-library use. For architectural decisions
   about context boundaries and DDD-style domain design, defer to the
-  `ddd-phoenix` skill. For test-driven development discipline (failing
+  `ddd-elixir` skill. For test-driven development discipline (failing
   test first), defer to the `tdd-elixir` skill — this skill covers the
   mechanical test rules (start_supervised!, no Process.sleep, etc.) but
   not the workflow.
@@ -40,7 +40,7 @@ common way to produce out-of-character code.
   from there.
 - **Existing codebase:** read 2-3 similar modules before adding new ones.
   Mirror their patterns even when they disagree with these defaults. The
-  defaults here are how to write *new* Phoenix code in 2026; an existing
+  defaults here are how to write _new_ Phoenix code in 2026; an existing
   codebase has its own history, and consistency beats correctness-in-the-
   abstract. If you genuinely think a refactor is warranted, surface it to
   the user before doing it.
@@ -64,7 +64,7 @@ more time than a 10-second lookup.
 
 When you've finished a coherent change set — a feature, fix, or refactor —
 run `mix precommit` and address any failures before declaring the task
-done. This is a *boundary* gate, not a per-edit tick: don't run it after
+done. This is a _boundary_ gate, not a per-edit tick: don't run it after
 every micro-edit, and don't skip it before handing back to the user.
 Phoenix's default `precommit` alias runs format, compile (with warnings
 as errors), and tests, which catches the bulk of mechanical regressions.
@@ -99,7 +99,7 @@ Elixir lists are linked lists, not arrays. `mylist[i]` does not work.
 
 ## `if`/`case`/`cond` results must be rebound outside the block
 
-Elixir variables are immutable but rebindable. Rebinding *inside* a block
+Elixir variables are immutable but rebindable. Rebinding _inside_ a block
 expression doesn't escape — the outer scope keeps the old value.
 
 **Wrong (the `assign` is thrown away):**
@@ -132,7 +132,7 @@ direct field access or a higher-level API.
 
 ## Predicate naming: `?` suffix, no `is_` prefix
 
-Reserve `is_thing` names for *guards* (macros that work in guard clauses).
+Reserve `is_thing` names for _guards_ (macros that work in guard clauses).
 Regular predicate functions end in `?`. So `admin?(user)`, not
 `is_admin(user)`.
 
@@ -237,7 +237,7 @@ for `Heroicons` modules or inlining SVGs.
 
 Same for `<.input>`: it's imported, it handles labels/errors/types, and
 using it saves you reimplementing form-field plumbing. If you override
-`class` on `<.input>`, your classes *replace* the defaults — they don't
+`class` on `<.input>`, your classes _replace_ the defaults — they don't
 merge. So your custom class string needs to fully style the input.
 
 # Ecto
@@ -503,7 +503,7 @@ The mechanics:
       doc = LazyHTML.from_fragment(html)
       LazyHTML.filter(doc, "your-selector") |> IO.inspect(label: "matches")
 
-For *workflow* discipline (failing test first, red-green-refactor), see
+For _workflow_ discipline (failing test first, red-green-refactor), see
 the `tdd-elixir` skill.
 
 # Test mechanics (general)
@@ -576,9 +576,9 @@ When building UI:
 
 - **Architectural decisions about Phoenix contexts** (where a schema
   belongs, naming, bounded contexts, coordinating between contexts) →
-  `ddd-phoenix` skill.
+  `ddd-elixir` skill.
 - **Test-driven workflow** (failing test first, what to test, how to
-  decompose) → `tdd-elixir` skill. This skill only covers the *mechanical*
+  decompose) → `tdd-elixir` skill. This skill only covers the _mechanical_
   test rules above.
 
 # Deep references
