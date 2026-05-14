@@ -43,6 +43,58 @@ end
 # Step 5: Refactor if needed, keeping tests green
 ```
 
+## Preferred Test Style
+
+Tests cluster into three layers. Each has a different default approach. Pick the layer first, then the approach follows.
+
+### Context/domain tests
+
+- Call real context functions. Do not mock them.
+- Use ExMachina factories for database setup.
+- Hit a real DB via the Ecto sandbox. Factories + sandbox is fast enough, and mocking the Repo or your own contexts hides exactly the bugs these tests exist to catch.
+
+### Feature/page tests
+
+- Use [`phoenix_test`](https://github.com/germsvel/phoenix_test) for user-facing flows. It works for both LiveView and dead views with one API.
+- Test behavior the user can see, not implementation details (assigns, socket state, internal messages).
+- Set up **preconditions** (existing users, existing records) with factories — that's fine.
+- Drive **user actions** (logging in, submitting forms, clicking buttons) through the UI, never by calling a context directly. Calling `Accounts.create_session/1` to "log in" inside a feature test defeats the point of the layer.
+- Escape hatch: when you genuinely need to assert on LiveView internals, drop down to `Phoenix.LiveViewTest` deliberately for that one test and note why in a short comment.
+
+### External boundaries (mock with Mimic)
+
+The boundary is roughly "anything you can't fully control inside the BEAM process the test runs in":
+
+- HTTP clients, payment processors, email, SMS, object storage, analytics — the usual outbound integrations.
+- **Oban** — assert jobs are enqueued (`Oban.Testing.assert_enqueued`); don't actually run them in unit tests.
+- **Phoenix.PubSub** — stub broadcasts; don't depend on real subscribers receiving messages.
+- **File system I/O** — stub `File.read`/`File.write`/etc. rather than touching real paths.
+- **Do not** mock the Repo, Ecto, or your own contexts.
+
+Prefer [Mimic](https://github.com/edgurgel/mimic) for new code. Older codebases will have Mox-based mocks — leave them, but don't add more.
+
+### Time
+
+Don't mock the system clock. Functions that care about time accept it as a parameter:
+
+```elixir
+def expire_token(token, now \\ DateTime.utc_now()) do
+  DateTime.compare(token.expires_at, now) == :lt
+end
+```
+
+Tests pass a fixed `DateTime`. The dependency is visible at the call site, the test is deterministic, and there's no stub to remember to clean up.
+
+### Factories
+
+- Use [ExMachina](https://github.com/beam-community/ex_machina). One factory per schema.
+- Keep factories minimal — stable, readable defaults that produce a valid record.
+- Pass overrides at the call site, not by creating factory variants. A reader of the test should see the attribute that matters right there.
+
+### Fake data
+
+Use [Faker](https://github.com/elixirs/faker) only when the value doesn't matter (filler emails, lorem ipsum bodies). When the test asserts on the value, hardcode it — a readable failure (`expected "Ada Lovelace", got nil`) is worth more than a realistic-looking one (`expected "Quincy Wuckert MD", got nil`).
+
 ## Test File Structure
 
 Match your source structure:
@@ -160,88 +212,103 @@ describe "transition_task/2" do
 end
 ```
 
-## Testing LiveView
+## Testing Feature/Page Flows with phoenix_test
 
-Use `Phoenix.LiveViewTest` for integration tests.
+`phoenix_test` drives both LiveView and dead views through one API. Set up state with factories, drive actions through the rendered page.
 
 ```elixir
-import Phoenix.LiveViewTest
+import PhoenixTest
 
-describe "TaskLive.Index" do
-  test "renders task list", %{conn: conn} do
-    task = task_fixture(title: "My Task")
-    {:ok, view, html} = live(conn, ~p"/tasks")
+describe "managing tasks" do
+  test "user creates a task from the index page", %{conn: conn} do
+    user = insert(:user)
 
-    assert html =~ "My Task"
-    assert has_element?(view, "#task-#{task.id}")
+    conn
+    |> log_in_user(user)
+    |> visit(~p"/tasks")
+    |> click_link("New Task")
+    |> fill_in("Title", with: "Ship the thing")
+    |> click_button("Create")
+    |> assert_has("#tasks", text: "Ship the thing")
+    |> assert_path(~p"/tasks")
   end
 
-  test "creates new task", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/tasks")
-
-    view
-    |> form("#task-form", task: %{title: "New Task"})
-    |> render_submit()
-
-    assert has_element?(view, "#tasks", "New Task")
+  test "blank title renders inline validation", %{conn: conn} do
+    conn
+    |> log_in_user(insert(:user))
+    |> visit(~p"/tasks/new")
+    |> fill_in("Title", with: "")
+    |> click_button("Create")
+    |> assert_has(".error", text: "can't be blank")
   end
 
-  test "validates task on change", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+  test "user deletes a task", %{conn: conn} do
+    user = insert(:user)
+    task = insert(:task, user: user, title: "Delete Me")
 
-    html =
-      view
-      |> form("#task-form", task: %{title: ""})
-      |> render_change()
-
-    assert html =~ "can't be blank"
-  end
-
-  test "deletes task", %{conn: conn} do
-    task = task_fixture(title: "Delete Me")
-    {:ok, view, _html} = live(conn, ~p"/tasks")
-
-    view
-    |> element("#task-#{task.id} button", "Delete")
-    |> render_click()
-
-    refute has_element?(view, "#task-#{task.id}")
+    conn
+    |> log_in_user(user)
+    |> visit(~p"/tasks")
+    |> within("#task-#{task.id}", fn session ->
+      click_button(session, "Delete")
+    end)
+    |> refute_has("#task-#{task.id}")
   end
 end
 ```
 
-## Test Data
+### Escape hatch: when you really need internals
 
-Use factories or fixture functions. Keep them minimal.
+`phoenix_test` deliberately hides assigns, sockets, and `handle_info` — those are implementation detail, and tests coupled to them break for the wrong reasons. If you genuinely need to assert on a LiveView's internal state (e.g., a complex `handle_info` pipeline with no UI manifestation), import `Phoenix.LiveViewTest` for that single test and leave a one-line comment about why. Don't mix the two libraries' helpers in the same test.
+
+## Test Data with ExMachina
+
+One factory per schema. Stable, readable defaults. Overrides at the call site.
 
 ```elixir
-# test/support/fixtures/accounts_fixtures.ex
-defmodule MyApp.AccountsFixtures do
-  def user_fixture(attrs \\ %{}) do
-    {:ok, user} =
-      attrs
-      |> Enum.into(%{
-        email: "user#{System.unique_integer()}@example.com",
-        name: "Test User"
-      })
-      |> MyApp.Accounts.create_user()
-
-    user
-  end
-end
-
-# Or with ExMachina
+# test/support/factory.ex
 defmodule MyApp.Factory do
   use ExMachina.Ecto, repo: MyApp.Repo
 
   def user_factory do
     %MyApp.Accounts.User{
-      email: sequence(:email, &"user#{&1}@example.com"),
+      email: sequence(:email, &"user-#{&1}@example.com"),
       name: "Test User"
+    }
+  end
+
+  def task_factory do
+    %MyApp.Tasks.Task{
+      title: "Test Task",
+      status: :todo,
+      user: build(:user)
     }
   end
 end
 ```
+
+### Pick the operation by intent
+
+| Operation | Use when |
+|---|---|
+| `insert/2` | Default for context tests. The function under test queries, updates, or associates — it needs a real row. |
+| `build/2` | The function doesn't touch the DB (changeset shape, struct manipulation, pure transformation). Avoids a needless write. |
+| `params_for/2` | Testing a changeset function directly: `User.changeset(%User{}, params_for(:user, email: "bad"))`. |
+
+### Override at the call site, don't grow factory variants
+
+```elixir
+# Good: the attribute that matters is right where the test reads
+test "rejects too-short titles" do
+  task = insert(:task, title: "x")
+  assert {:error, _} = Tasks.update_task(task, %{title: ""})
+end
+
+# Bad: hides the relevant value in a far-away factory definition
+def too_short_task_factory, do: %Task{title: "x", ...}
+```
+
+If a test needs a specific shape, pass it. Reserve factory definitions for "what does a valid one look like."
 
 ## What NOT to Do
 
@@ -286,6 +353,66 @@ expect(Repo, :insert, fn _ -> {:ok, %User{}} end)
 assert {:ok, %User{}} = Accounts.create_user(valid_attrs)
 assert Repo.get(User, user.id)  # Actually in database
 ```
+
+### ❌ Don't mock your own contexts
+
+```elixir
+# WRONG: stubbing internal code
+stub(MyApp.Accounts, :get_user, fn _ -> %User{id: 1} end)
+
+# RIGHT: call the real function with real (factory) data
+user = insert(:user)
+assert {:ok, _} = MyApp.Tasks.create_task(user, valid_attrs)
+```
+
+Mocking contexts means tests pass when your own code is broken. Mimic is for external boundaries — HTTP, payments, email, Oban, PubSub, file I/O — not for code you wrote.
+
+### ❌ Don't drive user actions through context calls in feature tests
+
+```elixir
+# WRONG: skipping the UI for the action under test
+test "user posts a comment", %{conn: conn} do
+  user = insert(:user)
+  post = insert(:post)
+  {:ok, _comment} = Comments.create_comment(user, post, %{body: "Hello"})
+
+  conn |> visit(~p"/posts/#{post}") |> assert_has(".comment", text: "Hello")
+end
+
+# RIGHT: drive the action through the rendered form
+test "user posts a comment", %{conn: conn} do
+  user = insert(:user)
+  post = insert(:post)
+
+  conn
+  |> log_in_user(user)
+  |> visit(~p"/posts/#{post}")
+  |> fill_in("Comment", with: "Hello")
+  |> click_button("Post")
+  |> assert_has(".comment", text: "Hello")
+end
+```
+
+Setting up *preconditions* (the user, the post) via factories is fine — those aren't user actions. The *action under test* is "user posts a comment," and that has to go through the form, or the test isn't testing what its name claims.
+
+### ❌ Don't use Faker for values you'll assert on
+
+```elixir
+# WRONG: the failure message won't tell you what the value was
+name = Faker.Person.name()
+{:ok, user} = Accounts.create_user(%{name: name})
+assert user.name == name
+
+# RIGHT: stable, readable
+{:ok, user} = Accounts.create_user(%{name: "Ada Lovelace"})
+assert user.name == "Ada Lovelace"
+```
+
+Faker is for values that don't matter. Asserted values matter.
+
+### ❌ Don't reach into LiveView internals from phoenix_test
+
+If you find yourself wanting `:sys.get_state` or `assigns` access inside a `phoenix_test` file, stop and switch that one test to `Phoenix.LiveViewTest` deliberately. Don't smuggle one library's helpers into the other — a reader can't tell which contract a mixed test is honoring, and the layering rule that motivates `phoenix_test` quietly erodes.
 
 ### ❌ Don't write tests that pass regardless of implementation
 
@@ -356,52 +483,64 @@ defmodule MyApp.TasksTest do
 end
 ```
 
-## Mocking External Dependencies with Mox
+## Mocking External Boundaries with Mimic
 
-Use behaviours + Mox for external services. Never mock Ecto or internal modules.
+Use [Mimic](https://github.com/edgurgel/mimic) to stub modules at the external boundary — HTTP, payments, email, SMS, storage, analytics, Oban, PubSub, file I/O. Mimic copies the real module so you can replace functions on it in tests; there's no behaviour to define upfront, which is the main reason to prefer it over Mox for new code.
+
+### Setup
 
 ```elixir
-# 1. Define a behaviour
-defmodule MyApp.WeatherAPI do
-  @callback get_forecast(String.t()) :: {:ok, map()} | {:error, term()}
-end
+# test/test_helper.exs
+Mimic.copy(MyApp.Stripe)
+Mimic.copy(MyApp.Mailer)
+Mimic.copy(File)
+ExUnit.start()
+```
 
-# 2. Create the real implementation
-defmodule MyApp.WeatherAPI.Client do
-  @behaviour MyApp.WeatherAPI
+Note: Mimic stubs are global by default and will leak across parallel tests. Put `setup :set_mimic_private` in any test module that uses `async: true`.
 
-  @impl true
-  def get_forecast(city) do
-    Req.get("https://api.weather.com/forecast", params: [city: city])
-  end
-end
+### Three operations, three intents
 
-# 3. Configure the mock in test_helper.exs
-Mox.defmock(MyApp.MockWeatherAPI, for: MyApp.WeatherAPI)
+Pick the operation that matches what the test is actually saying.
 
-# 4. Configure in config/test.exs
-# config :my_app, weather_api: MyApp.MockWeatherAPI
+| Operation | Means |
+|---|---|
+| `stub/3` | "Whatever happens, return this." No assertion that the call happened. Use for incidental dependencies the test needs to step past. |
+| `expect/3` | "This must be called, with these args, this many times." Use when the test's purpose *is* "this thing got called correctly." |
+| `reject/1` | "This must NOT be called." Use when not calling something is the point (e.g., short-circuit logic, idempotency). |
 
-# 5. Use in your context (reads from config)
-defmodule MyApp.Weather do
-  def weather_api, do: Application.get_env(:my_app, :weather_api, MyApp.WeatherAPI.Client)
+Don't reach for `expect` when you mean `stub` — failed expectation messages get noisy when every dependency carries a "must be called" demand, and the signal gets lost.
 
-  def get_forecast(city) do
-    weather_api().get_forecast(city)
-  end
-end
+### Example
 
-# 6. Test with mock
-import Mox
+```elixir
+import Mimic
 
-test "get_forecast returns weather data" do
-  expect(MyApp.MockWeatherAPI, :get_forecast, fn "London" ->
-    {:ok, %{temp: 15, condition: "cloudy"}}
+setup :set_mimic_private
+
+test "complete_purchase/1 charges the card and emails a receipt" do
+  stub(MyApp.Stripe, :charge, fn _ -> {:ok, %{id: "ch_123"}} end)
+
+  expect(MyApp.Mailer, :deliver, fn email ->
+    assert email.to == "buyer@example.com"
+    assert email.subject =~ "Receipt"
+    {:ok, email}
   end)
 
-  assert {:ok, %{temp: 15}} = Weather.get_forecast("London")
+  assert :ok = Orders.complete_purchase(order_attrs())
+end
+
+test "complete_purchase/1 does not email when the charge fails" do
+  stub(MyApp.Stripe, :charge, fn _ -> {:error, :card_declined} end)
+  reject(&MyApp.Mailer.deliver/1)
+
+  assert {:error, :card_declined} = Orders.complete_purchase(order_attrs())
 end
 ```
+
+### Mox (legacy)
+
+Older codebases use Mox with explicit behaviours and `Mox.defmock`. That pattern still works — leave existing Mox tests in place — but reach for Mimic for new code. It doesn't require a behaviour, and it works against modules you don't own (third-party libraries, `File`, etc.) where defining a behaviour would be awkward or impossible.
 
 ## Property-Based Testing with StreamData
 
