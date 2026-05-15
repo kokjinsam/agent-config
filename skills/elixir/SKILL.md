@@ -1,22 +1,15 @@
 ---
 name: elixir
 description: >
-  Phoenix v1.8+ and Elixir conventions, gotchas, and patterns for writing
-  code that compiles and behaves correctly. Use this skill whenever the user
-  is working on Phoenix or Elixir — writing or editing LiveViews, HEEx
-  templates, Ecto schemas, migrations, changesets, forms, contexts, tests,
-  or mix tasks. Trigger even on small edits or single-line changes: Phoenix
-  has many syntax footguns (HEEx `{...}` vs `<%= %>` interpolation, list
-  index access, `if`-rebinding, struct vs map access, form access via
-  changeset) where models regress to wrong patterns from training data
-  without explicit guardrails. Also trigger on questions about Phoenix
-  routing, LiveView streams, LiveView JS hooks, Ecto preloading, form
-  handling, and Elixir standard-library use. For architectural decisions
-  about context boundaries and DDD-style domain design, defer to the
-  `ddd-elixir` skill. For test-driven development discipline (failing
-  test first), defer to the `tdd-elixir` skill — this skill covers the
-  mechanical test rules (start_supervised!, no Process.sleep, etc.) but
-  not the workflow.
+  Phoenix v1.8+ and Elixir conventions for writing code that compiles and
+  behaves correctly. Use when working on Phoenix or Elixir code: LiveViews,
+  HEEx templates, Ecto schemas, migrations, changesets, forms, contexts,
+  tests, or mix tasks. Trigger even for small edits because Phoenix has common
+  footguns around HEEx interpolation, list access, if/case rebinding, struct
+  vs map access, and form handling. Also use for questions about routing,
+  LiveView streams, JS hooks, Ecto preloading, forms, and Elixir standard
+  library usage. For context boundaries or domain architecture, use
+  `ddd-elixir`; for failing-test-first workflow, use `tdd-elixir`.
 ---
 
 # Elixir & Phoenix conventions
