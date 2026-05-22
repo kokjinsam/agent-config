@@ -2,16 +2,10 @@
 name: phx-bounded-context
 description: >
   Implements bounded contexts in Elixir/Phoenix using aggregate-oriented DDD: a thin public
-  context facade that delegates to self-contained command and query handlers, in-memory aggregate
-  roots that own invariants and state machines, separate database-backed persistence schemas, and
-  top-level use cases for cross-context workflows. Use this skill whenever building or changing the
-  internals of a Phoenix context that has real business rules — placing/cancelling orders, state
-  transitions, money/totals, tenant or permission boundaries, aggregate consistency. Trigger on
-  requests like "scaffold a Sales context", "add a place_order command", "where does this business
-  rule go", "split this fat context module", "this aggregate is calling Repo", "add a query that
-  returns an order", "build a checkout that spans Sales/Billing/Inventory", or any work involving
-  commands, queries, aggregates, %Scope{}, embedded_schema vs schema, or use_cases/. Apply it even
-  when the user doesn't name the pattern but is clearly implementing context logic with invariants.
+  context facade that delegates to command and query handlers, in-memory aggregate roots
+  that own invariants and state machines, separate database-backed persistence schemas, and
+  top-level use cases for cross-context workflows. Use this skill whenever building or
+  changing the internals of a Phoenix context that has real business rules.
 ---
 
 # Phoenix Bounded Context Architecture
@@ -82,15 +76,15 @@ lib/my_app/
   use_cases/checkout.ex         # Cross-context orchestration
 ```
 
-| Layer | Owns | Never |
-| --- | --- | --- |
-| `MyApp.Sales` (facade) | Public API shape, `defdelegate` | Transactions, business rules, mapping |
-| `Commands.*` | Authorize, validate input, transaction, persist, return result | Cross-context orchestration |
-| `Queries.*` | Validate, authorize/filter, build query, map to result | Mutations |
-| `Order` (aggregate) | Invariants, state transitions, child updates, **mapping both ways** | Calling `Repo` |
-| `Repo.Sales.Order` (schema) | `schema "..."`, query fragments, persistence changesets | Business decisions |
-| `Sales.Policy` | Authorization decisions | Persistence, domain logic |
-| `UseCases.*` | Coordinate multiple contexts in one `Repo.transact` | Single-context details |
+| Layer                       | Owns                                                                | Never                                 |
+| --------------------------- | ------------------------------------------------------------------- | ------------------------------------- |
+| `MyApp.Sales` (facade)      | Public API shape, `defdelegate`                                     | Transactions, business rules, mapping |
+| `Commands.*`                | Authorize, validate input, transaction, persist, return result      | Cross-context orchestration           |
+| `Queries.*`                 | Validate, authorize/filter, build query, map to result              | Mutations                             |
+| `Order` (aggregate)         | Invariants, state transitions, child updates, **mapping both ways** | Calling `Repo`                        |
+| `Repo.Sales.Order` (schema) | `schema "..."`, query fragments, persistence changesets             | Business decisions                    |
+| `Sales.Policy`              | Authorization decisions                                             | Persistence, domain logic             |
+| `UseCases.*`                | Coordinate multiple contexts in one `Repo.transact`                 | Single-context details                |
 
 ## Core rules
 
