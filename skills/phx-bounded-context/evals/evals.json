@@ -1,0 +1,23 @@
+{
+  "skill_name": "phx-bounded-context",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm building a Phoenix app called Bookstore. I need a Subscriptions context where a customer can start a subscription, pause it, resume it, and cancel it. A subscription has a plan, a monthly price, and a current period. Pausing is only allowed while active, resuming only while paused, and you can't pause a cancelled subscription. Scaffold the context.",
+      "expected_output": "Full bounded context: thin MyApp.Subscriptions facade with defdelegate + ubiquitous-language command names (start_subscription/pause_subscription/resume_subscription/cancel_subscription), Subscriptions.Policy, command handlers each owning an embedded_schema input + Repo.transact, a Subscription aggregate as embedded_schema with Gearbox state machine (active/paused/cancelled), pure transitions, from_schema/to_attrs mapping and no Repo, persistence schema under Repo.Subscriptions, migration, and the test pyramid including StreamData property tests. Should ask for/confirm the app namespace and Scope module, and ask about glossary if unclear.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Here's an order aggregate from our Sales context. Review it against our architecture. It currently does `def place(order) do order |> Ecto.Changeset.change(status: :placed) |> Repo.update() end` and the OrderController calls Repo.get/2 directly to load orders. What's wrong and how should it be fixed?",
+      "expected_output": "Flags: (1) aggregate calling Repo — must be a pure transition returning {:ok, %{order | status: :placed}}, persistence belongs in the command handler; (2) controller calling Repo directly — must go through the public Sales facade / query handler. Should explain the why (pure aggregate enables property testing, facade keeps boundary stable) and show corrected code.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "In our Phoenix app, checkout needs to place an order in Sales, reserve stock in Inventory, and authorize a payment in Billing. If the payment fails we can't leave stock reserved or an order placed. Where should this live and how do I make it atomic across the three contexts?",
+      "expected_output": "Should place the workflow in lib/my_app/use_cases/checkout.ex (NOT inside a Sales command handler), calling each context's public API, and wrap all steps in a single Repo.transact so a later-step failure rolls back the earlier writes (one shared Repo). Should show the with-chain inside Repo.transact and note the use-case test for rollback.",
+      "files": []
+    }
+  ]
+}
