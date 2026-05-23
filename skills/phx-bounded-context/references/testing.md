@@ -1,13 +1,15 @@
 # Testing the Test Pyramid
 
-Generate tests at four levels, each matched to what its layer actually owns. The split matters: the
+Generate tests at three levels, each matched to what its layer actually owns. The split matters: the
 aggregate is pure and in-memory, so it gets fast property-based tests with no database; everything
-that touches `Repo`, scope, or HTTP gets conventional integration tests.
+that touches `Repo`, scope, or HTTP gets conventional integration tests. Cross-context behavior is
+not its own tier — it lives inside the originating command's handler tests, using real downstream
+contexts.
 
 ```
 Aggregate tests       Fast, property-based, no database. Invariants and transitions.
 Handler tests         Repo + transactions + scope + authorization + persistence + mapping.
-Use case tests        Cross-context orchestration and partial-failure rollback.
+                      For cross-context commands: real downstream contexts (no mocks) + rollback.
 Controller tests      HTTP behavior and response shape.
 ```
 
@@ -178,27 +180,48 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 end
 ```
 
-## Use case test
+## Cross-context tests live in the command's test file
 
-Verify the happy path and that a later-step failure rolls back earlier persisted writes (the shared
-`Repo.transact`). Use a real or stubbed downstream context that can be made to fail.
+When a command calls into other contexts (e.g. `Sales.place_order` calls `Inventory.reserve_stock`
+and `Billing.authorize_payment`), the cross-context paths are tested in the same
+`place_order_test.exs` file as the single-context paths — no separate test tier, no mocks. Drive
+the downstream contexts into the state you need (insufficient stock, payment that will fail) using
+their real public API, then assert both the bubbled error and that the earlier Sales write rolled
+back via the nested `Repo.transact`.
 
 ```elixir
-defmodule MyApp.UseCases.CheckoutTest do
+defmodule MyApp.Sales.Commands.PlaceOrderTest do
   use MyApp.DataCase, async: true
 
-  alias MyApp.UseCases.Checkout
+  alias MyApp.Repo
+  alias MyApp.Repo.Sales.Order, as: OrderSchema
+  alias MyApp.Sales
 
-  test "rolls back the placed order when payment authorization fails" do
-    scope = build_scope()
-    attrs = build_checkout_attrs(payment: :will_fail)
+  describe "place_order/2 with cross-context calls" do
+    test "rolls back the order when Billing rejects the payment" do
+      scope = build_scope()
+      attrs = order_attrs(payment: invalid_card_attrs())
 
-    assert {:error, _reason} = Checkout.run(scope, attrs)
-    # the order write from the first step must not survive the failed transaction
-    assert MyApp.Repo.aggregate(MyApp.Repo.Sales.Order, :count) == 0
+      assert {:error, :payment_declined} = Sales.place_order(scope, attrs)
+      # the order write must not survive the nested transaction's rollback
+      assert Repo.aggregate(OrderSchema, :count) == 0
+    end
+
+    test "rolls back the order when Inventory cannot reserve stock" do
+      scope = build_scope()
+      out_of_stock_product = insert_product(stock: 0)
+      attrs = order_attrs(product: out_of_stock_product)
+
+      assert {:error, :insufficient_stock} = Sales.place_order(scope, attrs)
+      assert Repo.aggregate(OrderSchema, :count) == 0
+    end
   end
 end
 ```
+
+> Reach for mocks only when a downstream call hits a real external system (e.g. a payment gateway
+> HTTP API). The cross-context call itself stays real — what gets stubbed is the system at the very
+> edge of the application.
 
 ## Controller test
 

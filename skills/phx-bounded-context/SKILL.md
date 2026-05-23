@@ -4,7 +4,8 @@ description: >
   Implements bounded contexts in Elixir/Phoenix using aggregate-oriented DDD: a thin public
   context facade that delegates to command and query handlers, in-memory aggregate roots
   that own invariants and state machines, separate database-backed persistence schemas, and
-  top-level use cases for cross-context workflows. Use this skill whenever building or
+  cross-context workflows expressed as direct command-to-command (or worker-to-command)
+  calls through the other context's public facade. Use this skill whenever building or
   changing the internals of a Phoenix context that has real business rules.
 ---
 
@@ -38,8 +39,9 @@ Four modes — infer which from the request:
 2. **Add an operation** — add a single command or query (plus the aggregate transition and tests) to
    an existing context, following its established conventions.
 3. **Review / refactor** — audit existing code against the rules here and fix violations: `Repo` in
-   an aggregate, a fat facade doing orchestration, hidden cross-context calls inside a handler,
-   child mutation bypassing the aggregate root, CRUD names where domain verbs belong.
+   an aggregate, a fat facade doing orchestration, cross-context calls inside an aggregate / policy
+   / query (instead of a command or worker), cross-context calls bypassing the facade, child
+   mutation bypassing the aggregate root, CRUD names where domain verbs belong.
 4. **Explain / guide** — answer how-to questions and point to the right layer without necessarily
    writing code.
 
@@ -73,18 +75,17 @@ lib/my_app/
   repo/sales/
     order.ex                    # schema "orders": queries, changesets
     order_line_item.ex          # schema "order_line_items"
-  use_cases/checkout.ex         # Cross-context orchestration
 ```
 
-| Layer                       | Owns                                                                | Never                                 |
-| --------------------------- | ------------------------------------------------------------------- | ------------------------------------- |
-| `MyApp.Sales` (facade)      | Public API shape, `defdelegate`                                     | Transactions, business rules, mapping |
-| `Commands.*`                | Authorize, validate input, transaction, persist, return result      | Cross-context orchestration           |
-| `Queries.*`                 | Validate, authorize/filter, build query, map to result              | Mutations                             |
-| `Order` (aggregate)         | Invariants, state transitions, child updates, **mapping both ways** | Calling `Repo`                        |
-| `Repo.Sales.Order` (schema) | `schema "..."`, query fragments, persistence changesets             | Business decisions                    |
-| `Sales.Policy`              | Authorization decisions                                             | Persistence, domain logic             |
-| `UseCases.*`                | Coordinate multiple contexts in one `Repo.transact`                 | Single-context details                |
+| Layer                       | Owns                                                                | Never                                            |
+| --------------------------- | ------------------------------------------------------------------- | ------------------------------------------------ |
+| `MyApp.Sales` (facade)      | Public API shape, `defdelegate`                                     | Transactions, business rules, mapping            |
+| `Commands.*`                | Authorize, validate input, transaction, persist, return result; may call other contexts via their facade | Reaching into another context's internals       |
+| `Queries.*`                 | Validate, authorize/filter, build query, map to result              | Mutations, calling other contexts                |
+| `Order` (aggregate)         | Invariants, state transitions, child updates, **mapping both ways** | Calling `Repo`, calling other contexts           |
+| `Repo.Sales.Order` (schema) | `schema "..."`, query fragments, persistence changesets             | Business decisions                               |
+| `Sales.Policy`              | Authorization decisions                                             | Persistence, domain logic, calling other contexts |
+| `Workers.*`                 | Async entry points; may call own and other contexts via facades     | Bypassing the facade                             |
 
 ## Core rules
 
@@ -179,9 +180,12 @@ Controllers pattern-match these to status codes. Keep this convention consistent
 ### 10. Transactions use Repo.transact
 
 Standardize on `Repo.transact/1` everywhere — it returns the `{:ok, _}` / `{:error, _}` from the
-function and rolls back automatically on `:error`, so there's no manual `Repo.rollback`. Use it in
-command handlers and, crucially, in cross-context use cases: because every context shares one `Repo`,
-a single `Repo.transact` in the use case gives atomic rollback across contexts.
+function and rolls back automatically on `:error`, so there's no manual `Repo.rollback`. Every
+command wraps its own work in `Repo.transact`. When one command calls another — in the same context
+or across contexts — the nested `Repo.transact` calls compose safely: every context shares one
+`Repo`, and Ecto rolls back the outer transaction when any inner `:error` bubbles up. You don't need
+to coordinate which command "owns" the outer transaction; wrap each handler the same way and let it
+nest.
 
 ```elixir
 def handle(%Scope{} = scope, attrs) do
@@ -197,23 +201,59 @@ def handle(%Scope{} = scope, attrs) do
 end
 ```
 
-### 11. Cross-context workflows live in use cases
+### 11. Cross-context calls go through the public facade
 
-A context must never secretly orchestrate another context's business process inside its own handler.
-Workflows spanning contexts go in `lib/my_app/use_cases/`, calling each context's public API and
-wrapping the steps in one `Repo.transact` so partial failures roll back cleanly.
+Command handlers and Oban workers may call other contexts directly — through the other context's
+public facade, never into its `Commands.*` or `Workers.*` modules. The same applies inside a single
+context: sibling commands call each other via `Sales.apply_discount/2`, not
+`Sales.Commands.ApplyDiscount`. The facade is the only stable surface; everything else is internal.
+
+Aggregates, policies, and queries do **not** call other contexts — that's a hard restriction.
+Cross-context orchestration lives in commands and workers, where transactions, authorization, and
+input validation already live. A query that needs data from a sister context is composed at the
+controller / LiveView level (call both `Sales.get_order` and `Billing.get_invoice` and assemble the
+view); promote that to a dedicated read-model context only when the composition repeats or becomes
+performance-sensitive.
 
 ```elixir
-def run(%Scope{} = scope, attrs) do
+# Inside Sales.Commands.PlaceOrder:
+def handle(%Scope{} = scope, attrs) do
   Repo.transact(fn ->
-    with {:ok, order} <- Sales.place_order(scope, attrs.order),
-         {:ok, _resv} <- Inventory.reserve_stock(scope, order.id),
-         {:ok, _pay}  <- Billing.authorize_payment(scope, order.id, attrs.payment) do
-      {:ok, order}
+    with :ok           <- Policy.authorize(scope, :place_order),
+         {:ok, command} <- validate(attrs),
+         {:ok, order}   <- build_order(command),
+         {:ok, order}   <- Order.place(order),
+         {:ok, schema}  <- insert_order_aggregate(scope, order),
+         {:ok, _resv}   <- Inventory.reserve_stock(scope, schema.id),
+         {:ok, _pay}    <- Billing.authorize_payment(scope, schema.id, attrs[:payment]) do
+      {:ok, Order.from_schema(schema)}
     end
   end)
 end
 ```
+
+Rules of the boundary:
+
+- **Scope flows verbatim.** Pass the same `%Scope{}` through — every context re-authorizes the
+  caller as it sees fit. No scope rewriting, no escalation to a system scope at the boundary.
+- **Errors bubble verbatim.** `{:error, :unauthorized}` from `Billing` flows up unchanged.
+  Controllers pattern-match the same tagged atoms regardless of which context produced them; don't
+  introduce a remap layer.
+- **Returns may be the called aggregate.** `Billing.authorize_payment` returning `%Billing.Payment{}`
+  is fine — accept the cross-context coupling rather than hiding behind opaque IDs. If Billing
+  refactors its aggregate, callers update; that's a normal cost.
+- **Names stay in ubiquitous language.** `Sales.place_order` keeps that name even when it
+  internally calls Inventory and Billing. The cross-context calls are an implementation detail of
+  the command, not part of its public identity.
+- **Workers are first-class entry points.** Like commands, workers may call across contexts via
+  facades. When a context needs an async cross-context entry point (e.g. Sales wants Billing to
+  authorize payment asynchronously), the called context exposes a facade function that enqueues its
+  own worker (`Billing.enqueue_payment_authorization(scope, ...)`). Never reach into another
+  context's worker module directly.
+- **Cycles are discouraged, not enforced.** Watch for them in code review. If a real cycle appears,
+  treat it as a design signal — usually a shared lower context should be extracted, or the
+  back-edge should become a `Phoenix.PubSub` event rather than a direct call. No compile-time
+  enforcement library is mandated.
 
 ### 12. Multi-tenancy is detected from Scope
 
@@ -245,8 +285,9 @@ Generate the full pyramid (details and templates in `references/testing.md`):
   subtotals, subtotal = qty × unit_price) and operation-sequence properties (any sequence of public
   ops preserves invariants; invalid transitions are rejected).
 - **Command/query handlers** — Repo-backed integration tests exercising scope, authorization,
-  transactions, persistence, and mapping.
-- **Use cases** — cross-context orchestration and partial-failure rollback.
+  transactions, persistence, and mapping. For commands that call other contexts, the same test file
+  covers cross-context paths with the real downstream contexts (no mocks) — including
+  partial-failure rollback through the nested `Repo.transact`.
 - **Controllers** — HTTP behavior and response shape.
 
 StreamData must be in `mix.exs` for property tests; flag it if absent.
@@ -259,10 +300,9 @@ Controller / LiveView / Worker
       -> Commands.* / Queries.*
           -> Order (aggregate)        # pure, owns mapping, no Repo
           -> Repo.Sales.* (schema) -> Repo
-
-Cross-context:
-Controller / Worker -> UseCases.* -> Sales / Inventory / Billing  (one Repo.transact)
+          -> MyApp.Billing (facade)   # cross-context: only from Commands.* or Workers.*
 ```
 
 The aggregate never depends on persistence behavior (only maps to/from its struct); the persistence
-schema holds no business decisions; the facade never orchestrates.
+schema holds no business decisions; the facade never orchestrates. Cross-context calls always enter
+through another context's facade, and only command handlers and workers may make them.

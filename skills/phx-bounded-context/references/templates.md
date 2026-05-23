@@ -14,8 +14,9 @@ namespace and the context/aggregate names. Mirror the surrounding codebase's con
 - [Updating an existing aggregate](#updating-an-existing-aggregate)
 - [Persistence schema](#persistence-schema)
 - [Persistence child schema](#persistence-child-schema)
-- [Use case (cross-context)](#use-case)
+- [Cross-context call in a command](#cross-context-call-in-a-command)
 - [Worker](#worker)
+- [Async cross-context entry point on a facade](#async-cross-context-entry-point-on-a-facade)
 - [Controller](#controller)
 - [Migration](#migration)
 
@@ -491,29 +492,46 @@ defmodule MyApp.Repo.Sales.OrderLineItem do
 end
 ```
 
-## Use case
+## Cross-context call in a command
 
-Cross-context orchestration, one shared `Repo.transact` for atomic rollback across contexts.
+Cross-context orchestration lives inside the originating command handler. Call the other context's
+public facade with the same `%Scope{}`, let errors bubble verbatim, and rely on nested
+`Repo.transact` for atomic rollback — every context shares one `Repo`, so an inner `:error` rolls
+back the outer transaction automatically.
 
 ```elixir
-defmodule MyApp.UseCases.Checkout do
+defmodule MyApp.Sales.Commands.PlaceOrder do
+  use Ecto.Schema
+  import Ecto.Changeset
+
   alias MyApp.Accounts.Scope
   alias MyApp.Billing
   alias MyApp.Inventory
   alias MyApp.Repo
-  alias MyApp.Sales
+  alias MyApp.Sales.Order
+  alias MyApp.Sales.Policy
+  alias MyApp.Repo.Sales.Order, as: OrderSchema
 
-  def run(%Scope{} = scope, attrs) do
+  # ... embedded_schema and validation as in the basic Command handler template ...
+
+  def handle(%Scope{} = scope, attrs) when is_map(attrs) do
     Repo.transact(fn ->
-      with {:ok, order} <- Sales.place_order(scope, attrs.order),
-           {:ok, _resv} <- Inventory.reserve_stock(scope, order.id),
-           {:ok, _pay} <- Billing.authorize_payment(scope, order.id, attrs.payment) do
-        {:ok, order}
+      with :ok            <- Policy.authorize(scope, :place_order),
+           {:ok, command} <- validate(attrs),
+           {:ok, order}   <- build_order(command),
+           {:ok, order}   <- Order.place(order),
+           {:ok, schema}  <- insert_order_aggregate(scope, order),
+           {:ok, _resv}   <- Inventory.reserve_stock(scope, schema.id),
+           {:ok, _pay}    <- Billing.authorize_payment(scope, schema.id, command.payment) do
+        {:ok, Order.from_schema(schema)}
       end
     end)
   end
 end
 ```
+
+> The same pattern applies inside a single context — sibling commands call each other through their
+> own facade (`Sales.apply_discount/2`), never through `Sales.Commands.ApplyDiscount` directly.
 
 ## Worker
 
@@ -535,6 +553,30 @@ defmodule MyApp.Sales.Workers.SendOrderConfirmation do
   end
 end
 ```
+
+## Async cross-context entry point on a facade
+
+When another context needs to trigger work in this one asynchronously, expose an enqueue function on
+this context's facade — never let outsiders reach into `Workers.*` directly. The facade stays the
+single surface for both sync and async cross-context calls.
+
+```elixir
+defmodule MyApp.Billing do
+  alias MyApp.Billing.Commands.AuthorizePayment
+  alias MyApp.Billing.Workers.AuthorizePaymentWorker
+
+  defdelegate authorize_payment(scope, order_id, attrs), to: AuthorizePayment, as: :handle
+
+  def enqueue_payment_authorization(scope, order_id, attrs) do
+    %{tenant_id: scope.tenant_id, order_id: order_id, attrs: attrs}
+    |> AuthorizePaymentWorker.new()
+    |> Oban.insert()
+  end
+end
+```
+
+Callers in Sales then do `Billing.enqueue_payment_authorization(scope, order_id, payment_attrs)`;
+they never know `AuthorizePaymentWorker` exists.
 
 ## Controller
 
