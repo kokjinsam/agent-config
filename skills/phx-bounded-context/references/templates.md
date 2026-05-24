@@ -29,7 +29,7 @@ defmodule MyApp.Sales do
 
   defdelegate place_order(scope, attrs), to: PlaceOrder, as: :handle
   defdelegate cancel_order(scope, order_id), to: CancelOrder, as: :handle
-  defdelegate get_order(scope, id), to: GetOrder, as: :handle
+  defdelegate get_order(scope, attrs), to: GetOrder, as: :handle
   defdelegate list_orders(scope, filters \\ %{}), to: ListOrders, as: :handle
 end
 ```
@@ -76,12 +76,11 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
   alias MyApp.Sales.Order
   alias MyApp.Sales.Policy
 
-  @primary_key false
   embedded_schema do
     field :customer_id, :binary_id
     field :currency, :string, default: "USD"
 
-    embeds_many :line_items, LineItem, primary_key: false do
+    embeds_many :line_items, LineItem do
       field :product_id, :binary_id
       field :sku, :string
       field :quantity, :integer
@@ -170,12 +169,9 @@ defmodule MyApp.Sales.Queries.GetOrder do
   alias MyApp.Repo
   alias MyApp.Sales.Order
 
-  @primary_key false
   embedded_schema do
     field :id, :binary_id
   end
-
-  def handle(%Scope{} = scope, id) when not is_map(id), do: handle(scope, %{id: id})
 
   def handle(%Scope{} = scope, attrs) when is_map(attrs) do
     with {:ok, input} <- validate(attrs) do
@@ -234,7 +230,7 @@ defmodule MyApp.Sales.Order do
 
     has_many :line_items, OrderLineItem, foreign_key: :order_id, on_replace: :delete
 
-    timestamps(type: :utc_datetime)
+    timestamps()
   end
 
   # --- changesets ---------------------------------------------------------
@@ -324,7 +320,7 @@ defmodule MyApp.Sales.OrderLineItem do
 
     belongs_to :order, Order
 
-    timestamps(type: :utc_datetime)
+    timestamps()
   end
 
   def changeset(line_item, attrs) do
@@ -391,7 +387,7 @@ defmodule MyApp.Sales.Workers.SendOrderConfirmation do
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "order_id" => order_id}}) do
     scope = %Scope{tenant_id: tenant_id, roles: [:system]}
 
-    with {:ok, _order} <- Sales.get_order(scope, order_id) do
+    with {:ok, _order} <- Sales.get_order(scope, %{id: order_id}) do
       # send confirmation, publish event, etc.
       :ok
     end
@@ -453,7 +449,7 @@ defmodule MyAppWeb.OrderController do
   end
 
   def show(conn, %{"id" => id}) do
-    case Sales.get_order(conn.assigns.scope, id) do
+    case Sales.get_order(conn.assigns.scope, %{id: id}) do
       {:ok, order} -> json(conn, render_order(order))
       {:error, :not_found} -> send_resp(conn, 404, "")
     end
@@ -469,24 +465,24 @@ defmodule MyApp.Repo.Migrations.CreateSalesOrders do
 
   def change do
     create table(:orders) do
-      add :customer_id, :binary_id, null: false
-      add :organization_id, :binary_id, null: false  # only if multi-tenant
-      add :tenant_id, :binary_id, null: false         # only if multi-tenant
-      add :status, :string, null: false
+      add :customer_id, :binary_id
+      add :organization_id, :binary_id  # only if multi-tenant
+      add :tenant_id, :binary_id         # only if multi-tenant
+      add :status, :string
       add :placed_at, :utc_datetime
-      add :total_cents, :integer, null: false, default: 0
-      add :currency, :string, null: false, default: "USD"
-      timestamps(type: :utc_datetime)
+      add :total_cents, :integer, default: 0
+      add :currency, :string, default: "USD"
+      timestamps()
     end
 
     create table(:order_line_items) do
-      add :order_id, references(:orders, on_delete: :delete_all), null: false
-      add :product_id, :binary_id, null: false
-      add :sku, :string, null: false
-      add :quantity, :integer, null: false
-      add :unit_price_cents, :integer, null: false
-      add :subtotal_cents, :integer, null: false
-      timestamps(type: :utc_datetime)
+      add :order_id, :binary_id
+      add :product_id, :binary_id
+      add :sku, :string
+      add :quantity, :integer
+      add :unit_price_cents, :integer
+      add :subtotal_cents, :integer
+      timestamps()
     end
 
     create index(:orders, [:customer_id])

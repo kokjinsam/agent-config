@@ -97,8 +97,13 @@ just the current user. For genuinely system-level work, pass an explicit system 
 
 ```elixir
 Sales.place_order(scope, attrs)   # not Sales.place_order(attrs, user)
-Sales.get_order(scope, id)        # not Sales.get_order(id)
+Sales.get_order(scope, attrs)     # not Sales.get_order(id) — pass %{id: id}
 ```
+
+Both commands and queries take `(scope, attrs)`. Even single-id reads pass a map
+(`Sales.get_order(scope, %{id: id})`) so every handler validates input through its own
+`embedded_schema` the same way, and adding a field later (filters, preloads, options) never
+changes the call shape.
 
 ### 2. The facade is thin
 
