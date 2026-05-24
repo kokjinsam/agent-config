@@ -1,26 +1,27 @@
 ---
 name: phx-bounded-context
 description: >
-  Implements bounded contexts in Elixir/Phoenix using aggregate-oriented DDD: a thin public
-  context facade that delegates to command and query handlers, in-memory aggregate roots
-  that own invariants and state machines, separate database-backed persistence schemas, and
+  Implements bounded contexts in Elixir/Phoenix using state machines and a CQRS-style
+  facade + handler + schema architecture: a thin public context facade that delegates to
+  command and query handlers, handlers that own input validation and orchestration inside
+  `Repo.transact`, Ecto schemas with Gearbox state machines as the domain model, and
   cross-context workflows expressed as direct command-to-command (or worker-to-command)
   calls through the other context's public facade. Use this skill whenever building or
   changing the internals of a Phoenix context that has real business rules.
 ---
 
-# Phoenix Bounded Context Architecture
+# Phoenix Bounded Context — State Machines, CQRS-Style Handlers, Ecto Schemas
 
-This skill implements bounded contexts using aggregate-oriented DDD on top of Phoenix and Ecto
-idioms. The goal is clear boundaries without fighting the framework: a thin public facade,
-self-contained command/query handlers, pure in-memory aggregates that protect invariants, and
-separate persistence schemas for the database.
+This skill implements bounded contexts on top of Phoenix and Ecto idioms with clear boundaries
+without fighting the framework: a thin public facade, self-contained command/query handlers, and
+Ecto schemas that ARE the domain model (Gearbox state machines, changesets, and intention-revealing
+transition functions live on the schema itself — there's no separate in-memory aggregate alongside).
 
 ## When this architecture is worth it
 
 This structure earns its overhead only when the domain has **meaningful business behavior**: real
-invariants, state transitions, money/totals, tenant or permission boundaries, or aggregate
-consistency requirements. Decide heuristically per context:
+invariants, state-machine lifecycles, money/totals, tenant or permission boundaries, or multi-step
+business rules that must stay consistent. Decide heuristically per context:
 
 - **Rich domain** (invariants, a state machine, multi-tenancy, things that must stay consistent) →
   apply the full structure below.
@@ -34,14 +35,15 @@ When in doubt, name the trade-off for the user and let them choose.
 
 Four modes — infer which from the request:
 
-1. **Scaffold a new context** — generate the full tree (facade, commands, queries, aggregate,
-   persistence schemas, policy, workers, migration, full test pyramid) from a domain description.
-2. **Add an operation** — add a single command or query (plus the aggregate transition and tests) to
-   an existing context, following its established conventions.
+1. **Scaffold a new context** — generate the full tree (facade, commands, queries, schemas with
+   Gearbox, policy, workers, migration, full test pyramid) from a domain description.
+2. **Add an operation** — add a single command or query (plus the schema transition function and
+   tests) to an existing context, following its established conventions.
 3. **Review / refactor** — audit existing code against the rules here and fix violations: `Repo` in
-   an aggregate, a fat facade doing orchestration, cross-context calls inside an aggregate / policy
-   / query (instead of a command or worker), cross-context calls bypassing the facade, child
-   mutation bypassing the aggregate root, CRUD names where domain verbs belong.
+   a schema module, a fat facade doing orchestration, cross-context calls inside a schema / policy /
+   query (instead of a command or worker), cross-context calls bypassing the facade, child mutation
+   bypassing parent functions, CRUD names where domain verbs belong, **a parallel in-memory
+   "aggregate" module duplicating the Ecto schema**.
 4. **Explain / guide** — answer how-to questions and point to the right layer without necessarily
    writing code.
 
@@ -59,33 +61,30 @@ Read the codebase first so generated code fits in, then confirm once before scaf
 Show the user the detected app prefix, Scope module, and Repo for a single confirmation, then build.
 
 For full code templates for every module, read `references/templates.md`. For the test pyramid
-(StreamData property tests, handler/use-case/controller tests), read `references/testing.md`.
+(handler/controller tests), read `references/testing.md`.
 
 ## The layers and where things live
 
 ```
 lib/my_app/
-  sales.ex                      # Thin public facade — defdelegate only
+  sales.ex                          # Thin public facade — defdelegate only
   sales/
-    policy.ex                   # Authorization for the context (default home for authz)
-    commands/place_order.ex     # Write use case: authorize, validate, transact, persist
-    queries/get_order.ex        # Read use case: validate, authorize/filter, fetch, map
-    workers/*.ex                # Oban jobs; call the public API
-    order.ex                    # Aggregate root: invariants, state machine, mapping (no Repo)
-  repo/sales/
-    order.ex                    # schema "orders": queries, changesets
-    order_line_item.ex          # schema "order_line_items"
+    policy.ex                       # Authorization for the context
+    commands/place_order.ex         # Write use case: authorize, validate, transact, persist
+    queries/get_order.ex            # Read use case: validate, authorize/filter, fetch
+    workers/*.ex                    # Oban jobs; call the public API
+    order.ex                        # Ecto schema + Gearbox + changesets + transition functions
+    order_line_item.ex              # Child Ecto schema
 ```
 
-| Layer                       | Owns                                                                | Never                                            |
-| --------------------------- | ------------------------------------------------------------------- | ------------------------------------------------ |
-| `MyApp.Sales` (facade)      | Public API shape, `defdelegate`                                     | Transactions, business rules, mapping            |
-| `Commands.*`                | Authorize, validate input, transaction, persist, return result; may call other contexts via their facade | Reaching into another context's internals       |
-| `Queries.*`                 | Validate, authorize/filter, build query, map to result              | Mutations, calling other contexts                |
-| `Order` (aggregate)         | Invariants, state transitions, child updates, **mapping both ways** | Calling `Repo`, calling other contexts           |
-| `Repo.Sales.Order` (schema) | `schema "..."`, query fragments, persistence changesets             | Business decisions                               |
-| `Sales.Policy`              | Authorization decisions                                             | Persistence, domain logic, calling other contexts |
-| `Workers.*`                 | Async entry points; may call own and other contexts via facades     | Bypassing the facade                             |
+| Layer                  | Owns                                                                                                                                                                                                            | Never                                             |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `MyApp.Sales` (facade) | Public API shape, `defdelegate`                                                                                                                                                                                 | Transactions, orchestration, business rules       |
+| `Commands.*`           | Authorize, validate input (own `embedded_schema`), `Repo.transact`, business preconditions in the `with` chain, call schema transition functions, persist, call other contexts via their facade                 | Reach into other context internals                |
+| `Queries.*`            | Validate input, authorize/filter, compose schema query fragments, execute via `Repo`, return schema preloaded as needed                                                                                         | Mutations, calling other contexts                 |
+| `Order` (Ecto schema)  | `schema "..."`, Gearbox state machine, changesets, transition functions that return changesets, query fragments                                                                                                 | Calling `Repo`, calling other contexts            |
+| `Sales.Policy`         | Authorization decisions                                                                                                                                                                                         | Persistence, domain logic, calling other contexts |
+| `Workers.*`            | Async entry points; may call own and other contexts via facades                                                                                                                                                 | Bypassing the facade                              |
 
 ## Core rules
 
@@ -122,62 +121,98 @@ codebase; the names are the API and should match how the business talks. **Queri
 ### 4. Handlers are self-contained
 
 A command or query handler owns one use case end to end for one context: authorization (via the
-policy), input validation, transaction boundary, loading/persisting schemas, calling the aggregate,
-mapping, and returning a result. Handlers own their **input schema** as an `embedded_schema` defined
-in the handler module itself — this validates external/string-keyed params and expresses intent,
-separate from persistence validation. If a handler seems to need several unrelated input schemas,
-split it into multiple handlers before nesting input modules.
+policy), input validation, transaction boundary, **business preconditions in the `with` chain**,
+calling schema transition functions, persisting through `Repo`, and returning a result. Handlers
+own their **input schema** as an `embedded_schema` defined in the handler module itself — this
+validates external/string-keyed params and expresses intent, separate from persistence validation.
+If a handler seems to need several unrelated input schemas, split it into multiple handlers before
+nesting input modules.
 
-### 5. Aggregates are pure and own everything domain
+This is where business rules live. Schema-level transition functions (e.g. `Order.place/1`) handle
+the state-machine transition and structural changeset; the handler is responsible for checking
+cross-field preconditions like "must have at least one line item" or "payment must be authorized"
+before calling the transition. This keeps the schema functions reusable and keeps use-case rules
+visible at the handler level.
 
-The aggregate root (`Order`) is an `embedded_schema`, **not** database-backed. It owns invariants,
-the state machine, and all updates to its children. It never calls `Repo`. Transition functions are
-pure and return `{:ok, aggregate}` or `{:error, reason}`.
+### 5. One schema per entity
 
-- **Children are inlined** in the root's `embedded_schema` (`embeds_many :line_items, ... do ... end`)
-  with **private** child changesets. They're internal to the aggregate, not standalone resources.
-  Ecto generates a nested struct module (`Order.LineItem`) — treat it as an implementation detail,
-  never call it from application code.
-- **All child updates go through the root**: `Order.add_line_item(order, attrs)`, not
-  `LineItem.change_quantity(...)`.
-- **Mapping lives in the aggregate, both directions** — this is a deliberate choice for this
-  codebase. The aggregate exposes `from_schema/1` (build the domain struct from a loaded persistence
-  struct) and `to_attrs/2` (domain → attrs map for persistence, taking `scope` for tenant fields).
-  The aggregate **may alias and pattern-match the `%Repo.Sales.Order{}` struct directly** — that
-  same-context coupling is acceptable. The hard rule is only that the aggregate never touches `Repo`;
-  it receives already-loaded structs from handlers.
+Don't create a parallel in-memory representation of the schema. There is no separate "aggregate"
+`embedded_schema` that mirrors the Ecto schema — the Ecto schema **is** the domain model. It owns
+the state machine, the changesets, the transition functions, and the query fragments. Splitting
+the in-memory model from the persistence schema makes mapping code grow, lets the two drift apart,
+and confuses coding agents about which one to update. One schema per entity keeps the model honest
+and the code small.
 
-### 6. State machines use Gearbox
+### 6. Schemas own domain behavior
 
-Always wire the state machine with `Gearbox` (`use Gearbox, field: :status, states: [...],
-transitions: %{...}`), owned by the aggregate root. The state machine prevents invalid transitions;
-aggregate functions enforce the extra business rules (e.g. `draft -> placed` is allowed by Gearbox,
-but `place/1` also requires at least one line item). Expose intention-revealing functions
-(`Order.place/1`, `Order.cancel/1`), never raw `%{order | status: :placed}`.
+The Ecto schema is where the domain lives. It owns:
 
-### 7. embedded_schema vs database-backed schema
+- The `schema "..."` definition (fields, associations, timestamps).
+- The Gearbox state machine.
+- Changesets (structural validation, defaults, formatting).
+- Transition functions that return changesets, e.g.:
 
-- `embedded_schema` → aggregates, inline children, handler input schemas, in-memory validation. Not
-  Repo-backed; never `Repo.get(MyApp.Sales.Order, id)`.
-- `schema "table"` → persistence, queries, associations, `cast_assoc`. Lives under `MyApp.Repo.*`.
+  ```elixir
+  def place(order) do
+    order
+    |> change(placed_at: DateTime.utc_now() |> DateTime.truncate(:second))
+    |> Gearbox.transition(:placed)
+  end
+  ```
 
-Map between them via the aggregate's `from_schema/to_attrs` so persistence concerns never leak into
-domain behavior.
+- Query fragments (`by_id/2`, `for_customer/2`, `visible_to/2`, `preload_line_items/1`,
+  `lock_for_update/1`) — returning `Ecto.Query`, not executing.
 
-### 8. Authorization lives in a policy module by default
+The schema does **not** call `Repo`; the handler does. Construct with
+`Order.changeset(%Order{}, attrs)` directly — no `new/1` wrapper, no separate aggregate struct.
+
+Children are `has_many` associations (separate schemas). Child mutations route through the parent
+schema via functions like `Order.add_line_item(order, attrs)` that build a changeset with
+`cast_assoc`. The parent owns the consistency boundary for its children's lifecycle decisions even
+though Ecto stores them in their own table.
+
+### 7. State machines use Gearbox
+
+Wire the state machine with `Gearbox` (`use Gearbox, field: :status, states: [...], transitions:
+%{...}`) directly on the Ecto schema. Gearbox guards the **legal transition graph** — `draft ->
+placed` allowed, `cancelled -> placed` rejected. Transition functions on the schema are thin: they
+apply the Gearbox transition and any structural side effects (setting `placed_at`, etc.) and return
+a changeset.
+
+**Cross-field business preconditions** — "must have at least one line item to place", "must have
+an authorized payment to ship" — live in the **handler's `with` chain**, not in the transition
+function or changeset:
+
+```elixir
+with :ok            <- Policy.authorize(scope, :place_order),
+     {:ok, command} <- validate(attrs),
+     {:ok, order}   <- load_order(scope, command.order_id),
+     :ok            <- ensure_has_line_items(order),       # ← business precondition
+     {:ok, placed}  <- Repo.update(Order.place(order)) do
+  {:ok, placed}
+end
+```
+
+### 8. `embedded_schema` is for handler input only
+
+`embedded_schema` is the right tool for one job: validating external/string-keyed input on a
+handler. It is **not** for parallel in-memory representations of persistence schemas — that
+re-introduces the duplication Rule 5 forbids.
+
+### 9. Authorization lives in a policy module by default
 
 Generate a `MyApp.Sales.Policy` with `authorize(scope, action, params \\ %{})` returning `:ok` /
-`{:error, :unauthorized}`; handlers call it. Keep authz out of the aggregate and the facade. When a
+`{:error, :unauthorized}`; handlers call it. Keep authz out of the schema and the facade. When a
 single operation's authorization grows genuinely complex, it's fine to drop a private `authorize/2`
 into that handler — but the policy module is the default home.
 
-### 9. Errors: tagged atoms + changesets
+### 10. Errors: tagged atoms + changesets
 
 Domain errors are tagged atoms (`{:error, :unauthorized}`, `{:error, :not_found}`,
 `{:error, :empty_order}`); input/persistence validation failures are `{:error, %Ecto.Changeset{}}`.
 Controllers pattern-match these to status codes. Keep this convention consistent across every layer.
 
-### 10. Transactions use Repo.transact
+### 11. Transactions use `Repo.transact`
 
 Standardize on `Repo.transact/1` everywhere — it returns the `{:ok, _}` / `{:error, _}` from the
 function and rolls back automatically on `:error`, so there's no manual `Repo.rollback`. Every
@@ -190,25 +225,25 @@ nest.
 ```elixir
 def handle(%Scope{} = scope, attrs) do
   Repo.transact(fn ->
-    with :ok <- Policy.authorize(scope, :place_order),
+    with :ok            <- Policy.authorize(scope, :place_order),
          {:ok, command} <- validate(attrs),
-         {:ok, order} <- build_order(command),
-         {:ok, order} <- Order.place(order),
-         {:ok, schema} <- insert_order_aggregate(scope, order) do
-      {:ok, Order.from_schema(schema)}
+         {:ok, order}   <- build_order(scope, command),
+         :ok            <- ensure_has_line_items(order),
+         {:ok, placed}  <- Repo.insert(Order.place(order)) do
+      {:ok, placed}
     end
   end)
 end
 ```
 
-### 11. Cross-context calls go through the public facade
+### 12. Cross-context calls go through the public facade
 
 Command handlers and Oban workers may call other contexts directly — through the other context's
 public facade, never into its `Commands.*` or `Workers.*` modules. The same applies inside a single
 context: sibling commands call each other via `Sales.apply_discount/2`, not
 `Sales.Commands.ApplyDiscount`. The facade is the only stable surface; everything else is internal.
 
-Aggregates, policies, and queries do **not** call other contexts — that's a hard restriction.
+**Schemas, policies, and queries do not call other contexts** — that's a hard restriction.
 Cross-context orchestration lives in commands and workers, where transactions, authorization, and
 input validation already live. A query that needs data from a sister context is composed at the
 controller / LiveView level (call both `Sales.get_order` and `Billing.get_invoice` and assemble the
@@ -219,14 +254,14 @@ performance-sensitive.
 # Inside Sales.Commands.PlaceOrder:
 def handle(%Scope{} = scope, attrs) do
   Repo.transact(fn ->
-    with :ok           <- Policy.authorize(scope, :place_order),
+    with :ok            <- Policy.authorize(scope, :place_order),
          {:ok, command} <- validate(attrs),
-         {:ok, order}   <- build_order(command),
-         {:ok, order}   <- Order.place(order),
-         {:ok, schema}  <- insert_order_aggregate(scope, order),
-         {:ok, _resv}   <- Inventory.reserve_stock(scope, schema.id),
-         {:ok, _pay}    <- Billing.authorize_payment(scope, schema.id, attrs[:payment]) do
-      {:ok, Order.from_schema(schema)}
+         {:ok, order}   <- build_order(scope, command),
+         :ok            <- ensure_has_line_items(order),
+         {:ok, placed}  <- Repo.insert(Order.place(order)),
+         {:ok, _resv}   <- Inventory.reserve_stock(scope, placed.id),
+         {:ok, _pay}    <- Billing.authorize_payment(scope, placed.id, command.payment) do
+      {:ok, placed}
     end
   end)
 end
@@ -239,9 +274,9 @@ Rules of the boundary:
 - **Errors bubble verbatim.** `{:error, :unauthorized}` from `Billing` flows up unchanged.
   Controllers pattern-match the same tagged atoms regardless of which context produced them; don't
   introduce a remap layer.
-- **Returns may be the called aggregate.** `Billing.authorize_payment` returning `%Billing.Payment{}`
+- **Returns may be the called schema.** `Billing.authorize_payment` returning `%Billing.Payment{}`
   is fine — accept the cross-context coupling rather than hiding behind opaque IDs. If Billing
-  refactors its aggregate, callers update; that's a normal cost.
+  refactors its schema, callers update; that's a normal cost.
 - **Names stay in ubiquitous language.** `Sales.place_order` keeps that name even when it
   internally calls Inventory and Billing. The cross-context calls are an implementation detail of
   the command, not part of its public identity.
@@ -255,42 +290,44 @@ Rules of the boundary:
   back-edge should become a `Phoenix.PubSub` event rather than a direct call. No compile-time
   enforcement library is mandated.
 
-### 12. Multi-tenancy is detected from Scope
+### 13. Multi-tenancy is detected from Scope
 
 Only scaffold `organization_id` / `tenant_id` columns, the `visible_to(query, scope)` filter, and
-tenant fields in `to_attrs` **if those fields exist on the project's `Scope` struct**. If the Scope
+tenant fields on the schema **if those fields exist on the project's `Scope` struct**. If the Scope
 has no org/tenant, omit them entirely rather than inventing tenancy the app doesn't have. When they
 do exist, every persistence query for that context filters through `visible_to/2`.
 
-### 13. Queries return aggregates by default
+### 14. Queries return schemas by default, preloaded as needed
 
-A query handler returns the domain aggregate by default. Introduce a flat read model only when the
-read is clearly display-only (lists, dashboards, reports, exports) or performance-sensitive — and
-prefer doing so on explicit request rather than pre-emptively.
+A query handler returns the Ecto schema struct by default. Callers declare what they need preloaded
+per call (a `preload` option on the handler, or a query-level preload fragment composed in). Don't
+deep-preload everything by default — that pulls expensive data nobody asked for. Introduce a flat
+read model only when the read is clearly display-only (lists, dashboards, reports, exports) or
+performance-sensitive — and prefer doing so on explicit request rather than pre-emptively.
 
-### 14. Other persistence conventions
+### 15. Other persistence conventions
 
-- Use `embeds_many` for child collections, never `embeds_one` for a list.
 - Money as integer cents + a `currency` string; don't mix representations.
 - Atom statuses → `Ecto.Enum`, not integers.
-- `has_many ..., on_replace: :delete` makes `cast_assoc` treat missing children as removed — correct
-  when the aggregate owns the full collection, dangerous for partial updates. Note it when used.
-- Use row locks (`lock: "FOR UPDATE"`) when loading an aggregate for update under concurrency.
+- `has_many ..., on_replace: :delete` makes `cast_assoc` treat missing children as removed —
+  correct when the parent owns the full collection, dangerous for partial updates. Note it when
+  used.
+- Use row locks (`lock: "FOR UPDATE"`) when loading a parent for update under concurrency.
 
 ## Testing
 
-Generate the full pyramid (details and templates in `references/testing.md`):
+Generate the pyramid (details and templates in `references/testing.md`):
 
-- **Aggregate** — fast StreamData property tests, no database. Cover data properties (totals = sum of
-  subtotals, subtotal = qty × unit_price) and operation-sequence properties (any sequence of public
-  ops preserves invariants; invalid transitions are rejected).
-- **Command/query handlers** — Repo-backed integration tests exercising scope, authorization,
-  transactions, persistence, and mapping. For commands that call other contexts, the same test file
-  covers cross-context paths with the real downstream contexts (no mocks) — including
-  partial-failure rollback through the nested `Repo.transact`.
-- **Controllers** — HTTP behavior and response shape.
+- **Handler tests** — Repo-backed integration tests exercising scope, authorization (allowed and
+  denied), input validation failures, the happy path, state transitions, and persistence. For
+  commands that call other contexts, the same test file covers cross-context paths with the real
+  downstream contexts (no mocks) — including partial-failure rollback through the nested
+  `Repo.transact`. Property-style tests (operation sequences preserve invariants) MAY be added
+  here when the domain is rich enough to justify the setup cost, but they're not the default tier.
+- **Controller tests** — HTTP behavior and response shape.
 
-StreamData must be in `mix.exs` for property tests; flag it if absent.
+StreamData is only needed if you choose to do property-style handler tests; flag it if absent and
+you're adding such tests.
 
 ## Dependency direction
 
@@ -298,11 +335,11 @@ StreamData must be in `mix.exs` for property tests; flag it if absent.
 Controller / LiveView / Worker
   -> MyApp.Sales (facade)
       -> Commands.* / Queries.*
-          -> Order (aggregate)        # pure, owns mapping, no Repo
-          -> Repo.Sales.* (schema) -> Repo
-          -> MyApp.Billing (facade)   # cross-context: only from Commands.* or Workers.*
+          -> Order (Ecto schema) -> Repo   # schema is the model; handler calls Repo
+          -> MyApp.Billing (facade)         # cross-context: only from Commands.* or Workers.*
 ```
 
-The aggregate never depends on persistence behavior (only maps to/from its struct); the persistence
-schema holds no business decisions; the facade never orchestrates. Cross-context calls always enter
-through another context's facade, and only command handlers and workers may make them.
+The schema holds the domain (Gearbox + changesets + transition functions) but never calls `Repo`;
+the handler is the only layer that calls `Repo`; the facade orchestrates nothing. Cross-context
+calls always enter through another context's facade, and only command handlers and workers may
+make them.

@@ -1,7 +1,7 @@
 # Code Templates
 
 Full code templates for each layer. Substitute `MyApp` / `Sales` / `Order` with the detected app
-namespace and the context/aggregate names. Mirror the surrounding codebase's conventions (id type,
+namespace and the context/entity names. Mirror the surrounding codebase's conventions (id type,
 `timestamps` type, formatting) where they differ.
 
 ## Contents
@@ -10,10 +10,8 @@ namespace and the context/aggregate names. Mirror the surrounding codebase's con
 - [Policy](#policy)
 - [Command handler](#command-handler)
 - [Query handler](#query-handler)
-- [Aggregate root (with mapping)](#aggregate-root)
-- [Updating an existing aggregate](#updating-an-existing-aggregate)
-- [Persistence schema](#persistence-schema)
-- [Persistence child schema](#persistence-child-schema)
+- [Ecto schema (parent, with Gearbox + transitions + queries)](#ecto-schema-parent)
+- [Child Ecto schema](#child-ecto-schema)
 - [Cross-context call in a command](#cross-context-call-in-a-command)
 - [Worker](#worker)
 - [Async cross-context entry point on a facade](#async-cross-context-entry-point-on-a-facade)
@@ -64,8 +62,9 @@ end
 ## Command handler
 
 The handler owns its input `embedded_schema`, authorizes via the policy, wraps the work in
-`Repo.transact`, calls the aggregate, and persists. Returns the domain aggregate via
-`Order.from_schema/1`.
+`Repo.transact`, checks business preconditions in the `with` chain, calls the schema's transition
+function (which returns a changeset), and persists through `Repo`. Returns the persisted schema
+struct.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrder do
@@ -76,7 +75,6 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
   alias MyApp.Repo
   alias MyApp.Sales.Order
   alias MyApp.Sales.Policy
-  alias MyApp.Repo.Sales.Order, as: OrderSchema
 
   @primary_key false
   embedded_schema do
@@ -93,12 +91,12 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
 
   def handle(%Scope{} = scope, attrs) when is_map(attrs) do
     Repo.transact(fn ->
-      with :ok <- Policy.authorize(scope, :place_order),
+      with :ok            <- Policy.authorize(scope, :place_order),
            {:ok, command} <- validate(attrs),
-           {:ok, order} <- build_order(command),
-           {:ok, order} <- Order.place(order),
-           {:ok, schema} <- insert_order_aggregate(scope, order) do
-        {:ok, Order.from_schema(schema)}
+           {:ok, order}   <- build_order(scope, command),
+           :ok            <- ensure_has_line_items(order),
+           {:ok, placed}  <- Repo.insert(Order.place(order)) do
+        {:ok, placed}
       end
     end)
   end
@@ -114,7 +112,6 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     |> cast(attrs, [:customer_id, :currency])
     |> validate_required([:customer_id, :currency])
     |> cast_embed(:line_items, with: &line_item_changeset/2, required: true)
-    |> validate_has_line_items()
   end
 
   defp line_item_changeset(line_item, attrs) do
@@ -125,37 +122,44 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     |> validate_number(:unit_price_cents, greater_than_or_equal_to: 0)
   end
 
-  defp validate_has_line_items(changeset) do
-    if Enum.empty?(get_field(changeset, :line_items) || []) do
-      add_error(changeset, :line_items, "must contain at least one item")
-    else
-      changeset
-    end
-  end
+  # Cross-field business precondition lives in the handler, not the schema.
+  defp ensure_has_line_items(%Order{line_items: [_ | _]}), do: :ok
+  defp ensure_has_line_items(%Order{}), do: {:error, :empty_order}
 
-  defp build_order(%__MODULE__{} = command) do
-    base = %{customer_id: command.customer_id, currency: command.currency, status: :draft,
-             total_cents: 0, line_items: []}
-
-    with {:ok, order} <- Order.new(base) do
-      Enum.reduce_while(command.line_items, {:ok, order}, fn attrs, {:ok, order} ->
-        case Order.add_line_item(order, Map.from_struct(attrs)) do
-          {:ok, order} -> {:cont, {:ok, order}}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
+  # Build an in-memory %Order{} (with line items) ready for the state transition.
+  # We don't insert yet — the handler's transaction holds the transition + insert atomically.
+  defp build_order(%Scope{} = scope, %__MODULE__{} = command) do
+    line_items =
+      Enum.map(command.line_items, fn li ->
+        %{
+          product_id: li.product_id,
+          sku: li.sku,
+          quantity: li.quantity,
+          unit_price_cents: li.unit_price_cents,
+          subtotal_cents: li.quantity * li.unit_price_cents
+        }
       end)
-    end
-  end
 
-  defp insert_order_aggregate(%Scope{} = scope, %Order{} = order) do
-    %OrderSchema{}
-    |> OrderSchema.aggregate_changeset(Order.to_attrs(scope, order))
-    |> Repo.insert()
+    attrs = %{
+      customer_id: command.customer_id,
+      currency: command.currency,
+      # include tenant fields only if Scope carries them:
+      organization_id: scope.organization && scope.organization.id,
+      tenant_id: scope.tenant_id,
+      total_cents: Enum.reduce(line_items, 0, &(&1.subtotal_cents + &2)),
+      line_items: line_items
+    }
+
+    %Order{}
+    |> Order.changeset(attrs)
+    |> apply_action(:insert)
   end
 end
 ```
 
 ## Query handler
+
+Returns the schema directly. Preloads are explicit.
 
 ```elixir
 defmodule MyApp.Sales.Queries.GetOrder do
@@ -165,7 +169,6 @@ defmodule MyApp.Sales.Queries.GetOrder do
   alias MyApp.Accounts.Scope
   alias MyApp.Repo
   alias MyApp.Sales.Order
-  alias MyApp.Repo.Sales.Order, as: OrderSchema
 
   @primary_key false
   embedded_schema do
@@ -175,9 +178,17 @@ defmodule MyApp.Sales.Queries.GetOrder do
   def handle(%Scope{} = scope, id) when not is_map(id), do: handle(scope, %{id: id})
 
   def handle(%Scope{} = scope, attrs) when is_map(attrs) do
-    with {:ok, input} <- validate(attrs),
-         {:ok, schema} <- fetch_order(scope, input) do
-      {:ok, Order.from_schema(schema)}
+    with {:ok, input} <- validate(attrs) do
+      query =
+        Order
+        |> Order.by_id(input.id)
+        |> Order.visible_to(scope)
+        |> Order.preload_line_items()
+
+      case Repo.one(query) do
+        nil -> {:error, :not_found}
+        order -> {:ok, order}
+      end
     end
   end
 
@@ -187,33 +198,21 @@ defmodule MyApp.Sales.Queries.GetOrder do
     |> validate_required([:id])
     |> apply_action(:validate)
   end
-
-  defp fetch_order(%Scope{} = scope, %__MODULE__{} = input) do
-    query =
-      OrderSchema
-      |> OrderSchema.by_id(input.id)
-      |> OrderSchema.visible_to(scope)
-      |> OrderSchema.preload_line_items()
-
-    case Repo.one(query) do
-      nil -> {:error, :not_found}
-      schema -> {:ok, schema}
-    end
-  end
 end
 ```
 
 > Drop the `visible_to/2` call only if the project's `Scope` has no org/tenant fields.
 
-## Aggregate root
+## Ecto schema (parent)
 
-`embedded_schema`, Gearbox state machine, inline children with private changesets, pure transitions,
-and **mapping in both directions**. Never calls `Repo`.
+One schema per entity. It owns the table, the Gearbox state machine, changesets, transition
+functions (which return changesets), and query fragments. It does **not** call `Repo`.
 
 ```elixir
 defmodule MyApp.Sales.Order do
   use Ecto.Schema
   import Ecto.Changeset
+  import Ecto.Query
 
   use Gearbox,
     field: :status,
@@ -222,204 +221,13 @@ defmodule MyApp.Sales.Order do
     transitions: %{draft: [:placed, :cancelled], placed: [:cancelled]}
 
   alias MyApp.Accounts.Scope
-  alias MyApp.Repo.Sales.Order, as: OrderSchema
-
-  embedded_schema do
-    field :customer_id, :binary_id
-    field :status, Ecto.Enum, values: [:draft, :placed, :cancelled], default: :draft
-    field :placed_at, :utc_datetime
-    field :total_cents, :integer, default: 0
-    field :currency, :string, default: "USD"
-
-    embeds_many :line_items, LineItem, primary_key: false do
-      field :id, :integer
-      field :product_id, :binary_id
-      field :sku, :string
-      field :quantity, :integer
-      field :unit_price_cents, :integer
-      field :subtotal_cents, :integer
-    end
-  end
-
-  # --- construction -------------------------------------------------------
-
-  def new(attrs) do
-    %__MODULE__{}
-    |> changeset(attrs)
-    |> apply_action(:insert)
-  end
-
-  def changeset(order, attrs) do
-    order
-    |> cast(attrs, [:id, :customer_id, :status, :placed_at, :total_cents, :currency])
-    |> validate_required([:customer_id, :status, :total_cents, :currency])
-    |> validate_number(:total_cents, greater_than_or_equal_to: 0)
-    |> cast_embed(:line_items, with: &line_item_changeset/2)
-  end
-
-  # --- transitions (pure) -------------------------------------------------
-
-  def add_line_item(%__MODULE__{status: :draft} = order, attrs) do
-    with {:ok, line_item} <- new_line_item(attrs) do
-      line_items = order.line_items ++ [line_item]
-      {:ok, %{order | line_items: line_items, total_cents: calculate_total_cents(line_items)}}
-    end
-  end
-
-  def add_line_item(%__MODULE__{}, _attrs), do: {:error, :order_not_editable}
-
-  def place(%__MODULE__{status: :draft, line_items: [_ | _]} = order) do
-    with {:ok, order} <- transition(order, :placed) do
-      {:ok, %{order | placed_at: DateTime.utc_now() |> DateTime.truncate(:second),
-                      total_cents: calculate_total_cents(order.line_items)}}
-    end
-  end
-
-  def place(%__MODULE__{status: :draft, line_items: []}), do: {:error, :empty_order}
-  def place(%__MODULE__{}), do: {:error, :order_not_placeable}
-
-  def cancel(%__MODULE__{status: :placed} = order), do: transition(order, :cancelled)
-  def cancel(%__MODULE__{status: :draft} = order), do: transition(order, :cancelled)
-  def cancel(%__MODULE__{}), do: {:error, :order_not_cancellable}
-
-  # --- mapping (both directions, no Repo) ---------------------------------
-
-  def from_schema(%OrderSchema{} = schema) do
-    attrs = %{
-      id: schema.id,
-      customer_id: schema.customer_id,
-      status: schema.status,
-      placed_at: schema.placed_at,
-      total_cents: schema.total_cents,
-      currency: schema.currency,
-      line_items: schema.line_items |> List.wrap() |> Enum.map(&line_item_from_schema/1)
-    }
-
-    {:ok, order} = new(attrs)
-    order
-  end
-
-  def to_attrs(%Scope{} = scope, %__MODULE__{} = order) do
-    %{
-      customer_id: order.customer_id,
-      # include only if Scope has these fields:
-      organization_id: scope.organization && scope.organization.id,
-      tenant_id: scope.tenant_id,
-      status: order.status,
-      placed_at: order.placed_at,
-      total_cents: order.total_cents,
-      currency: order.currency,
-      line_items: Enum.map(order.line_items, &line_item_to_attrs/1)
-    }
-  end
-
-  defp line_item_from_schema(li) do
-    %{id: li.id, product_id: li.product_id, sku: li.sku, quantity: li.quantity,
-      unit_price_cents: li.unit_price_cents, subtotal_cents: li.subtotal_cents}
-  end
-
-  defp line_item_to_attrs(li) do
-    %{id: li.id, product_id: li.product_id, sku: li.sku, quantity: li.quantity,
-      unit_price_cents: li.unit_price_cents, subtotal_cents: li.subtotal_cents}
-  end
-
-  # --- private helpers ----------------------------------------------------
-
-  defp calculate_total_cents(line_items),
-    do: Enum.reduce(line_items, 0, fn li, acc -> acc + (li.subtotal_cents || 0) end)
-
-  defp new_line_item(attrs) do
-    struct!(__MODULE__.LineItem)
-    |> line_item_changeset(attrs)
-    |> apply_action(:insert)
-  end
-
-  defp line_item_changeset(line_item, attrs) do
-    line_item
-    |> cast(attrs, [:id, :product_id, :sku, :quantity, :unit_price_cents, :subtotal_cents])
-    |> validate_required([:product_id, :sku, :quantity, :unit_price_cents])
-    |> validate_number(:quantity, greater_than: 0)
-    |> validate_number(:unit_price_cents, greater_than_or_equal_to: 0)
-    |> put_calculated_subtotal()
-  end
-
-  defp put_calculated_subtotal(changeset) do
-    quantity = get_field(changeset, :quantity)
-    unit_price_cents = get_field(changeset, :unit_price_cents)
-
-    if is_integer(quantity) and is_integer(unit_price_cents) do
-      put_change(changeset, :subtotal_cents, quantity * unit_price_cents)
-    else
-      changeset
-    end
-  end
-end
-```
-
-> Mapping referencing `%OrderSchema{}` directly is intentional and acceptable — both modules belong
-> to the same context. The only hard rule is that the aggregate never calls `Repo`.
-
-## Updating an existing aggregate
-
-Load through a scope-aware (and optionally locked) query, map to the aggregate, apply behavior,
-persist back — all inside one `Repo.transact`.
-
-```elixir
-defmodule MyApp.Sales.Commands.PlaceExistingOrder do
-  alias MyApp.Accounts.Scope
-  alias MyApp.Repo
-  alias MyApp.Sales.Order
-  alias MyApp.Sales.Policy
-  alias MyApp.Repo.Sales.Order, as: OrderSchema
-
-  def handle(%Scope{} = scope, order_id) do
-    Repo.transact(fn ->
-      with :ok <- Policy.authorize(scope, :place_order),
-           {:ok, schema} <- load_for_update(scope, order_id),
-           {:ok, placed} <- Order.place(Order.from_schema(schema)),
-           {:ok, saved} <- update_order_aggregate(scope, schema, placed) do
-        {:ok, Order.from_schema(saved)}
-      end
-    end)
-  end
-
-  defp load_for_update(%Scope{} = scope, order_id) do
-    OrderSchema
-    |> OrderSchema.by_id(order_id)
-    |> OrderSchema.visible_to(scope)
-    |> OrderSchema.lock_for_update()
-    |> OrderSchema.preload_line_items()
-    |> Repo.one()
-    |> case do
-      nil -> {:error, :not_found}
-      schema -> {:ok, schema}
-    end
-  end
-
-  defp update_order_aggregate(scope, schema, %Order{} = order) do
-    schema
-    |> OrderSchema.aggregate_changeset(Order.to_attrs(scope, order))
-    |> Repo.update()
-  end
-end
-```
-
-## Persistence schema
-
-```elixir
-defmodule MyApp.Repo.Sales.Order do
-  use Ecto.Schema
-  import Ecto.Changeset
-  import Ecto.Query
-
-  alias MyApp.Accounts.Scope
-  alias MyApp.Repo.Sales.OrderLineItem
+  alias MyApp.Sales.OrderLineItem
 
   schema "orders" do
     field :customer_id, :binary_id
     field :organization_id, :binary_id   # only if Scope has organization
     field :tenant_id, :binary_id         # only if Scope has tenant
-    field :status, Ecto.Enum, values: [:draft, :placed, :cancelled]
+    field :status, Ecto.Enum, values: [:draft, :placed, :cancelled], default: :draft
     field :placed_at, :utc_datetime
     field :total_cents, :integer, default: 0
     field :currency, :string, default: "USD"
@@ -428,6 +236,49 @@ defmodule MyApp.Repo.Sales.Order do
 
     timestamps(type: :utc_datetime)
   end
+
+  # --- changesets ---------------------------------------------------------
+
+  def changeset(order, attrs) do
+    order
+    |> cast(attrs, [
+      :customer_id, :organization_id, :tenant_id,
+      :status, :placed_at, :total_cents, :currency
+    ])
+    |> validate_required([:customer_id, :status, :total_cents, :currency])
+    |> validate_number(:total_cents, greater_than_or_equal_to: 0)
+    |> cast_assoc(:line_items, with: &OrderLineItem.changeset/2)
+  end
+
+  # --- transition functions (return changesets) --------------------------
+
+  def place(order) do
+    order
+    |> change(placed_at: DateTime.utc_now() |> DateTime.truncate(:second))
+    |> Gearbox.transition(:placed)
+  end
+
+  def cancel(order) do
+    order
+    |> change()
+    |> Gearbox.transition(:cancelled)
+  end
+
+  # Child mutations route through the parent so the parent's invariants stay
+  # in one place even though Ecto stores children in their own table.
+  def add_line_item(order, attrs) do
+    new_item = Map.put(attrs, :subtotal_cents, attrs.quantity * attrs.unit_price_cents)
+    existing = Enum.map(order.line_items, &Map.from_struct/1)
+    items = existing ++ [new_item]
+
+    order
+    |> changeset(%{
+      line_items: items,
+      total_cents: Enum.reduce(items, 0, &(&1.subtotal_cents + &2))
+    })
+  end
+
+  # --- query fragments (return Ecto.Query, never execute) ----------------
 
   def by_id(query \\ __MODULE__, id), do: from(o in query, where: o.id == ^id)
 
@@ -441,33 +292,28 @@ defmodule MyApp.Repo.Sales.Order do
       where: o.tenant_id == ^scope.tenant_id
   end
 
-  def preload_line_items(query \\ __MODULE__), do: from(o in query, preload: [:line_items])
-  def lock_for_update(query \\ __MODULE__), do: from(o in query, lock: "FOR UPDATE")
+  def preload_line_items(query \\ __MODULE__),
+    do: from(o in query, preload: [:line_items])
 
-  def changeset(order, attrs) do
-    order
-    |> cast(attrs, [:customer_id, :organization_id, :tenant_id, :status, :placed_at,
-                    :total_cents, :currency])
-    |> validate_required([:customer_id, :status, :total_cents, :currency])
-    |> validate_number(:total_cents, greater_than_or_equal_to: 0)
-  end
-
-  def aggregate_changeset(order, attrs) do
-    order
-    |> changeset(attrs)
-    |> cast_assoc(:line_items, with: &OrderLineItem.changeset/2)
-  end
+  def lock_for_update(query \\ __MODULE__),
+    do: from(o in query, lock: "FOR UPDATE")
 end
 ```
 
-## Persistence child schema
+> The transition functions return changesets, not `{:ok, _}` / `{:error, _}`. The handler runs them
+> through `Repo.insert` / `Repo.update`, which surfaces Gearbox transition errors as changeset
+> errors — keeping the error shape consistent.
+
+## Child Ecto schema
+
+Lives alongside the parent under `sales/`, not under a separate `repo/` subtree.
 
 ```elixir
-defmodule MyApp.Repo.Sales.OrderLineItem do
+defmodule MyApp.Sales.OrderLineItem do
   use Ecto.Schema
   import Ecto.Changeset
 
-  alias MyApp.Repo.Sales.Order
+  alias MyApp.Sales.Order
 
   schema "order_line_items" do
     field :product_id, :binary_id
@@ -483,7 +329,7 @@ defmodule MyApp.Repo.Sales.OrderLineItem do
 
   def changeset(line_item, attrs) do
     line_item
-    |> cast(attrs, [:id, :product_id, :sku, :quantity, :unit_price_cents, :subtotal_cents])
+    |> cast(attrs, [:product_id, :sku, :quantity, :unit_price_cents, :subtotal_cents])
     |> validate_required([:product_id, :sku, :quantity, :unit_price_cents, :subtotal_cents])
     |> validate_number(:quantity, greater_than: 0)
     |> validate_number(:unit_price_cents, greater_than_or_equal_to: 0)
@@ -510,7 +356,6 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
   alias MyApp.Repo
   alias MyApp.Sales.Order
   alias MyApp.Sales.Policy
-  alias MyApp.Repo.Sales.Order, as: OrderSchema
 
   # ... embedded_schema and validation as in the basic Command handler template ...
 
@@ -518,12 +363,12 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     Repo.transact(fn ->
       with :ok            <- Policy.authorize(scope, :place_order),
            {:ok, command} <- validate(attrs),
-           {:ok, order}   <- build_order(command),
-           {:ok, order}   <- Order.place(order),
-           {:ok, schema}  <- insert_order_aggregate(scope, order),
-           {:ok, _resv}   <- Inventory.reserve_stock(scope, schema.id),
-           {:ok, _pay}    <- Billing.authorize_payment(scope, schema.id, command.payment) do
-        {:ok, Order.from_schema(schema)}
+           {:ok, order}   <- build_order(scope, command),
+           :ok            <- ensure_has_line_items(order),
+           {:ok, placed}  <- Repo.insert(Order.place(order)),
+           {:ok, _resv}   <- Inventory.reserve_stock(scope, placed.id),
+           {:ok, _pay}    <- Billing.authorize_payment(scope, placed.id, command.payment) do
+        {:ok, placed}
       end
     end)
   end
@@ -595,7 +440,9 @@ defmodule MyAppWeb.OrderController do
         conn |> put_status(:unprocessable_entity) |> json(%{errors: translate_errors(changeset)})
 
       {:error, :empty_order} ->
-        conn |> put_status(:unprocessable_entity) |> json(%{error: "Order must contain at least one line item"})
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: "Order must contain at least one line item"})
 
       {:error, :unauthorized} ->
         send_resp(conn, 403, "")

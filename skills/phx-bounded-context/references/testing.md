@@ -1,146 +1,25 @@
 # Testing the Test Pyramid
 
-Generate tests at three levels, each matched to what its layer actually owns. The split matters: the
-aggregate is pure and in-memory, so it gets fast property-based tests with no database; everything
-that touches `Repo`, scope, or HTTP gets conventional integration tests. Cross-context behavior is
-not its own tier — it lives inside the originating command's handler tests, using real downstream
-contexts.
+Generate tests at two main levels:
 
 ```
-Aggregate tests       Fast, property-based, no database. Invariants and transitions.
-Handler tests         Repo + transactions + scope + authorization + persistence + mapping.
-                      For cross-context commands: real downstream contexts (no mocks) + rollback.
-Controller tests      HTTP behavior and response shape.
+Handler tests       Repo + transactions + scope + authorization + persistence + state transitions.
+                    For cross-context commands: real downstream contexts (no mocks) + rollback.
+Controller tests    HTTP behavior and response shape.
 ```
 
-Property tests need `{:stream_data, "~> 1.0", only: [:test]}` (or similar) in `mix.exs`. If it's
-absent, add it (or flag it for the user) before generating property tests.
+Cross-context behavior is not its own tier — it lives inside the originating command's handler
+tests, using real downstream contexts.
 
-## Why aggregates get property tests
-
-Because aggregate functions are pure (`Order.add_line_item/2`, `Order.place/1`, `Order.cancel/1`
-return `{:ok, order}` / `{:error, reason}` with no I/O), they need no fixtures, no `Repo.insert!`, no
-SQL sandbox, no preloads. That makes it cheap to throw thousands of generated inputs and operation
-sequences at them and assert invariants hold every time.
-
-Cover **two kinds** of properties:
-
-- **Data properties** — relationships that must always hold over generated data. E.g. order total
-  equals the sum of line-item subtotals; each subtotal equals `quantity * unit_price_cents`.
-- **Operation-sequence properties** — any sequence of public operations preserves invariants. Generate
-  random sequences of `add_line_item` / `place` / `cancel`, apply them (ignoring `{:error, _}`
-  results, which represent correctly-rejected operations), and assert invariants on the final state.
-
-Useful `Order` properties: total = sum of subtotals; subtotal = qty × price; non-draft orders reject
-edits; empty orders can't be placed; invalid transitions are rejected; cancelling doesn't change the
-total; placed orders can't be placed again.
-
-## Aggregate data property test
-
-```elixir
-defmodule MyApp.Sales.OrderPropertyTest do
-  use ExUnit.Case, async: true
-  use ExUnitProperties
-
-  alias MyApp.Sales.Order
-
-  defp uuid_generator do
-    gen all bytes <- binary(length: 16) do
-      Ecto.UUID.load!(bytes)
-    end
-  end
-
-  defp line_item_generator do
-    gen all product_id <- uuid_generator(),
-            sku <- string(:alphanumeric, min_length: 1),
-            quantity <- integer(1..100),
-            unit_price_cents <- integer(0..100_000) do
-      %{product_id: product_id, sku: sku, quantity: quantity, unit_price_cents: unit_price_cents}
-    end
-  end
-
-  property "order total equals the sum of line item subtotals" do
-    check all customer_id <- uuid_generator(),
-              line_items <- list_of(line_item_generator(), min_length: 1, max_length: 50) do
-      {:ok, order} =
-        Order.new(%{customer_id: customer_id, currency: "USD", status: :draft,
-                    total_cents: 0, line_items: []})
-
-      {:ok, order} =
-        Enum.reduce_while(line_items, {:ok, order}, fn attrs, {:ok, order} ->
-          case Order.add_line_item(order, attrs) do
-            {:ok, order} -> {:cont, {:ok, order}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-
-      expected = order.line_items |> Enum.map(& &1.subtotal_cents) |> Enum.sum()
-      assert order.total_cents == expected
-    end
-  end
-end
-```
-
-## Aggregate operation-sequence property test
-
-```elixir
-defmodule MyApp.Sales.OrderSequencePropertyTest do
-  use ExUnit.Case, async: true
-  use ExUnitProperties
-
-  alias MyApp.Sales.Order
-
-  defp operation_generator do
-    one_of([
-      constant(:place),
-      constant(:cancel),
-      gen all quantity <- integer(1..10), unit_price_cents <- integer(0..10_000) do
-        {:add_line_item,
-         %{product_id: Ecto.UUID.generate(), sku: "SKU-#{System.unique_integer([:positive])}",
-           quantity: quantity, unit_price_cents: unit_price_cents}}
-      end
-    ])
-  end
-
-  property "all operation sequences preserve order invariants" do
-    check all operations <- list_of(operation_generator(), max_length: 100) do
-      {:ok, order} =
-        Order.new(%{customer_id: Ecto.UUID.generate(), currency: "USD", status: :draft,
-                    total_cents: 0, line_items: []})
-
-      final =
-        Enum.reduce(operations, order, fn op, order ->
-          case apply_operation(order, op) do
-            {:ok, order} -> order
-            {:error, _reason} -> order
-          end
-        end)
-
-      assert_order_invariants(final)
-    end
-  end
-
-  defp apply_operation(order, {:add_line_item, attrs}), do: Order.add_line_item(order, attrs)
-  defp apply_operation(order, :place), do: Order.place(order)
-  defp apply_operation(order, :cancel), do: Order.cancel(order)
-
-  defp assert_order_invariants(order) do
-    expected = order.line_items |> Enum.map(& &1.subtotal_cents) |> Enum.sum()
-    assert order.total_cents == expected
-
-    for li <- order.line_items do
-      assert li.quantity > 0
-      assert li.unit_price_cents >= 0
-      assert li.subtotal_cents == li.quantity * li.unit_price_cents
-    end
-  end
-end
-```
+There's no fast pure-aggregate tier any more because there's no separate aggregate: the schema is
+the domain model, and exercising its transitions meaningfully requires the Repo. If your domain is
+genuinely rich enough to warrant property-style operation-sequence testing, do it at the handler
+tier — see the optional aside at the bottom.
 
 ## Command/query handler test
 
 Repo-backed. Exercise authorization (allowed and denied scopes), validation failures, the happy
-path, persistence, and that `from_schema` mapping round-trips.
+path, the state transition, and persistence. Assert on the returned schema struct directly.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrderTest do
@@ -148,32 +27,57 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 
   alias MyApp.Sales
 
-  defp scope(perms), do: %MyApp.Accounts.Scope{permissions: perms, tenant_id: Ecto.UUID.generate()}
+  defp scope(perms),
+    do: %MyApp.Accounts.Scope{permissions: perms, tenant_id: Ecto.UUID.generate()}
 
   describe "place_order/2" do
-    test "places a valid order and returns the domain aggregate" do
+    test "places a valid order and returns the persisted schema" do
       attrs = %{
         "customer_id" => Ecto.UUID.generate(),
         "currency" => "USD",
         "line_items" => [
-          %{"product_id" => Ecto.UUID.generate(), "sku" => "A1", "quantity" => 2, "unit_price_cents" => 500}
+          %{
+            "product_id" => Ecto.UUID.generate(),
+            "sku" => "A1",
+            "quantity" => 2,
+            "unit_price_cents" => 500
+          }
         ]
       }
 
       assert {:ok, order} = Sales.place_order(scope([:place_order]), attrs)
       assert order.status == :placed
       assert order.total_cents == 1000
+      assert is_struct(order, MyApp.Sales.Order)
+      assert order.placed_at
     end
 
-    test "rejects an empty order" do
-      attrs = %{"customer_id" => Ecto.UUID.generate(), "currency" => "USD", "line_items" => []}
+    test "rejects an empty order via business precondition" do
+      attrs = %{
+        "customer_id" => Ecto.UUID.generate(),
+        "currency" => "USD",
+        "line_items" => []
+      }
+
+      # input validation flags missing line_items before the precondition fires, so this
+      # surfaces as a changeset error from the handler's input embedded_schema
       assert {:error, %Ecto.Changeset{}} = Sales.place_order(scope([:place_order]), attrs)
     end
 
     test "denies a scope without permission" do
-      attrs = %{"customer_id" => Ecto.UUID.generate(), "currency" => "USD",
-                "line_items" => [%{"product_id" => Ecto.UUID.generate(), "sku" => "A1",
-                                   "quantity" => 1, "unit_price_cents" => 100}]}
+      attrs = %{
+        "customer_id" => Ecto.UUID.generate(),
+        "currency" => "USD",
+        "line_items" => [
+          %{
+            "product_id" => Ecto.UUID.generate(),
+            "sku" => "A1",
+            "quantity" => 1,
+            "unit_price_cents" => 100
+          }
+        ]
+      }
+
       assert {:error, :unauthorized} = Sales.place_order(scope([]), attrs)
     end
   end
@@ -194,8 +98,8 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
   use MyApp.DataCase, async: true
 
   alias MyApp.Repo
-  alias MyApp.Repo.Sales.Order, as: OrderSchema
   alias MyApp.Sales
+  alias MyApp.Sales.Order
 
   describe "place_order/2 with cross-context calls" do
     test "rolls back the order when Billing rejects the payment" do
@@ -204,7 +108,7 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 
       assert {:error, :payment_declined} = Sales.place_order(scope, attrs)
       # the order write must not survive the nested transaction's rollback
-      assert Repo.aggregate(OrderSchema, :count) == 0
+      assert Repo.aggregate(Order, :count) == 0
     end
 
     test "rolls back the order when Inventory cannot reserve stock" do
@@ -213,7 +117,7 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
       attrs = order_attrs(product: out_of_stock_product)
 
       assert {:error, :insufficient_stock} = Sales.place_order(scope, attrs)
-      assert Repo.aggregate(OrderSchema, :count) == 0
+      assert Repo.aggregate(Order, :count) == 0
     end
   end
 end
@@ -242,3 +146,15 @@ defmodule MyAppWeb.OrderControllerTest do
   end
 end
 ```
+
+## Optional: property-style handler tests
+
+When a domain is rich enough that you genuinely want "any sequence of valid operations preserves
+the invariants" coverage, write that test at the handler tier — drive sequences through the public
+context functions (`Sales.place_order`, `Sales.add_line_item`, `Sales.cancel_order`) and assert on
+the persisted result. This is slower than pure in-memory property tests and isn't free, so reach
+for it only when the domain interaction graph is genuinely complex (multi-step lifecycles, many
+optional commands, intricate cross-field rules).
+
+`{:stream_data, "~> 1.0", only: [:test]}` (or similar) needs to be in `mix.exs` if you go this
+route — flag it if absent.
