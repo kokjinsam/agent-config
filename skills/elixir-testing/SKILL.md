@@ -173,7 +173,7 @@ end
 
 ## Pure functions
 
-No DB, no process, no time — just plain assertions. These are the cheapest tests you have, and the only place doctests and property tests earn their keep.
+No DB, no process, no time — just plain assertions. These are the cheapest tests you have, and the only place doctests earn their keep. Property tests are happiest here too — cheap setup means you can crank thousands of generated inputs through — but they can also pay off at higher tiers when the domain has rich invariants and a complex interaction graph; you just accept the higher per-iteration cost. See the property-based testing section below.
 
 ### Time is a parameter, not a mock
 
@@ -261,6 +261,10 @@ end
 ```
 
 When a property fails, StreamData shrinks the input to the smallest case that still breaks — read the shrunk value, it usually names the bug.
+
+### Beyond pure functions
+
+Property tests aren't strictly pure-only. When a domain has a rich interaction graph — many commands, intricate cross-field rules, multi-step lifecycles — a property test that drives random *sequences* of public context calls through the real Repo can surface ordering bugs that example-based tests miss. The cost is real (each iteration runs through transactions, factories, and DB writes, so iteration counts shrink), so reach for it only when the domain genuinely justifies it. Most apps don't need it; some absolutely do.
 
 ## Test data with ExMachina
 
@@ -376,12 +380,20 @@ test "get_task/2 can't read another user's task" do
 end
 ```
 
-**Ecto state transitions.** When a schema has a status machine, assert both the allowed and the rejected transitions — the rejected ones are where bugs hide.
+**Ecto state transitions.** When a schema has a status machine, assert both the allowed and the rejected transitions — the rejected ones are where bugs hide. The error shape depends on how the transition function is written: a function that returns `{:ok, _}` / `{:error, _}` surfaces a tagged atom; a function that returns a changeset (e.g. Gearbox applied to a changeset, then `Repo.update`) surfaces an `%Ecto.Changeset{}` with the transition error attached. Pin whichever shape your code actually returns.
 
 ```elixir
+# Tagged-atom shape:
 test "rejects todo -> done (must pass through in_progress)" do
   task = insert(:task, status: :todo)
   assert {:error, :invalid_transition} = Tasks.transition_task(task, :done)
+end
+
+# Changeset shape (transition function returns a changeset, handler runs Repo.update):
+test "rejects todo -> done (must pass through in_progress)" do
+  task = insert(:task, status: :todo)
+  assert {:error, %Ecto.Changeset{} = changeset} = Tasks.transition_task(task, :done)
+  assert %{status: [_ | _]} = errors_on(changeset)
 end
 ```
 
