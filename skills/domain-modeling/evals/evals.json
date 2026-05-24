@@ -4,7 +4,7 @@
     {
       "id": 1,
       "prompt": "We're building a hotel booking system. A room can be requested, confirmed, checked in, checked out, or expired. I want to make sure we can never confirm two bookings for the same room on overlapping dates, and that a booking can't be checked in before it's confirmed. Help me model this domain.",
-      "expected_output": "An architecture doc capturing the bounded context, ubiquitous language, commands/queries, events, invariants, and state transitions. Because double-booking is high-harm, it should judge TLA+ warranted, produce a small .tla/.cfg modeling the overlap/confirm-before-checkin invariants, run it via run_tlc.sh, and list what was abstracted away. No implementation code.",
+      "expected_output": "An architecture doc capturing the bounded context, ubiquitous language, commands/queries, invariants, and state transitions. Because double-booking is high-harm, it should judge TLA+ warranted, produce a small .tla/.cfg modeling the overlap/confirm-before-checkin invariants, run it via run_tlc.sh, and list what was abstracted away. No implementation code.",
       "files": []
     },
     {
