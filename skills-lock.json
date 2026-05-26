@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "skill-cleaner": {
+      "source": "steipete/agent-scripts",
+      "sourceType": "github",
+      "skillPath": "skills/skill-cleaner/SKILL.md",
+      "computedHash": "c3b9bb9f2e7d6290924498ede6cd797346135b8b74327359717686a34240b0af"
+    }
+  }
+}
