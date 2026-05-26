@@ -1,13 +1,10 @@
 ---
 name: phx-bounded-context
 description: >
-  Implements bounded contexts in Elixir/Phoenix using state machines and a layered domain
-  architecture: a thin public context facade, command and query handlers, internal workflows for
-  multi-step orchestration (often driven by Oban workers), Ecto schemas with Gearbox state machines
-  as the domain model, and cross-context coordination via other contexts' public facades.
-  Authorization lives at the boundary (controllers / LiveViews) — commands and workflows trust the
-  caller to have authorized. Use this skill whenever building or changing the internals of a Phoenix
-  context that has real business rules.
+  Scaffold, change, or review rich Elixir/Phoenix bounded contexts with scope-first APIs, thin
+  facades, command/query handlers, internal workflows/Oban workers, Ecto schemas as Gearbox
+  state-machine domain models, boundary authorization, cross-context facade calls, and Repo-backed
+  tests.
 ---
 
 # Phoenix Bounded Context — State Machines, CQRS-Style Handlers, Workflows, Ecto Schemas
@@ -355,7 +352,7 @@ end
 | Commands     | **Yes**                          |
 | Workflows    | **Yes**                          |
 | Workers      | Typically no — delegate to a workflow that does |
-| Queries      | **No** — composition lives at controller/LiveView OR in a read workflow |
+| Queries      | **No** — composition lives at controller/LiveView or a dedicated read model |
 | Schemas      | **No** (hard restriction)        |
 | Policies     | **No** (hard restriction)        |
 
@@ -389,7 +386,10 @@ Workflows are an **internal** layer (not on the facade) for multi-step domain pr
 - An **Oban worker** needs to drive (the common case — workers stay thin and delegate to a
   workflow that owns the multi-step work);
 - A command needs to delegate to for non-trivial orchestration;
-- A read needs to compose across contexts (a "read workflow").
+
+Workflows are not for read-only aggregation. Repeated cross-context reads should live at the
+boundary, in an explicit read model/projection, or in a separate reporting context with its own
+public API.
 
 **Location:** `lib/my_app/sales/workflows/*.ex`, parallel to `commands/` and `queries/`.
 
@@ -430,8 +430,9 @@ read model only when the read is clearly display-only (lists, dashboards, report
 performance-sensitive — and prefer doing so on explicit request rather than pre-emptively.
 
 Queries do **not** call other context facades. Cross-context read composition lives at the
-controller/LiveView level (call both `Sales.get_order` and `Billing.get_invoice` and assemble),
-OR in a **read workflow** when the composition repeats or is intrinsic.
+controller/LiveView level (call both `Sales.get_order` and `Billing.get_invoice` and assemble).
+If the composition repeats or becomes performance-sensitive, introduce a dedicated read
+model/projection or reporting context rather than hiding the dependency inside a query or workflow.
 
 ### 16. Return shapes — virtual fields over anonymous maps
 

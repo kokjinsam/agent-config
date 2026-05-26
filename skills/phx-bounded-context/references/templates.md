@@ -16,7 +16,7 @@ namespace and the context/entity names. Mirror the surrounding codebase's conven
 - Cross-context reference (bare FK, no `belongs_to`)
 - Cross-context call inside a command/workflow
 - Worker (rebuilds scope, calls a workflow)
-- Async cross-context entry point on a facade
+- Async cross-context entry point through a facade
 - Controller (authorization at boundary)
 - Migration
 
@@ -100,7 +100,6 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     Repo.transact(fn ->
       with {:ok, command} <- validate(attrs),
            {:ok, order}   <- build_order(scope, command),
-           :ok            <- ensure_has_line_items(order),
            {:ok, placed}  <- Repo.insert(Order.place(order)) do
         {:ok, placed}
       end
@@ -118,6 +117,7 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     |> cast(attrs, [:customer_id, :currency])
     |> validate_required([:customer_id, :currency])
     |> cast_embed(:line_items, with: &line_item_changeset/2, required: true)
+    |> validate_length(:line_items, min: 1)
   end
 
   defp line_item_changeset(line_item, attrs) do
@@ -127,10 +127,6 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     |> validate_number(:quantity, greater_than: 0)
     |> validate_number(:unit_price_cents, greater_than_or_equal_to: 0)
   end
-
-  # Cross-field business precondition lives in the handler, not the schema.
-  defp ensure_has_line_items(%Order{line_items: [_ | _]}), do: :ok
-  defp ensure_has_line_items(%Order{}), do: {:error, :empty_order}
 
   # Build an in-memory %Order{} (with line items) ready for the state transition.
   defp build_order(%Scope{} = scope, %__MODULE__{} = command) do
@@ -145,20 +141,32 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
         }
       end)
 
-    attrs = %{
-      customer_id: command.customer_id,
-      currency: command.currency,
-      # include tenant fields only if Scope carries them:
-      organization_id: scope.organization && scope.organization.id,
-      tenant_id: scope.tenant_id,
-      total_cents: Enum.reduce(line_items, 0, &(&1.subtotal_cents + &2)),
-      line_items: line_items
-    }
+    attrs =
+      %{
+        customer_id: command.customer_id,
+        currency: command.currency,
+        total_cents: Enum.reduce(line_items, 0, &(&1.subtotal_cents + &2)),
+        line_items: line_items
+      }
+      |> Map.merge(tenant_attrs_from_scope(scope))
 
     %Order{}
     |> Order.changeset(attrs)
     |> apply_action(:insert)
   end
+
+  # Generate this helper only when Scope carries tenant/org fields.
+  defp tenant_attrs_from_scope(%Scope{} = scope) do
+    scope
+    |> Map.from_struct()
+    |> Map.take([:organization_id, :tenant_id])
+    |> maybe_put_organization_id(scope)
+  end
+
+  defp maybe_put_organization_id(attrs, %{organization: %{id: organization_id}}),
+    do: Map.put(attrs, :organization_id, organization_id)
+
+  defp maybe_put_organization_id(attrs, _scope), do: attrs
 end
 ```
 
@@ -203,10 +211,6 @@ defmodule MyApp.Sales.Queries.GetOrder do
 end
 ```
 
-> Drop the `visible_to/2` call only if the project's `Scope` has no org/tenant fields.
-> Queries never call other context facades — composition lives at the controller/LiveView or in a
-> read workflow.
-
 ## Workflow
 
 Internal multi-step orchestration. **Not** exposed on the facade. Called by a command or a worker.
@@ -247,13 +251,17 @@ end
 
 One schema per entity. It owns the table, the Gearbox state machine, changesets, transition
 functions (which return changesets), `build!/1` for in-memory variants, and query fragments. It
-does **not** call `Repo`.
+does **not** call `Repo`. The template below shows a binary-id project; drop `@primary_key` /
+`@foreign_key_type` and the binary-id migration fields when the existing project uses integer ids.
 
 ```elixir
 defmodule MyApp.Sales.Order do
   use Ecto.Schema
   import Ecto.Changeset
   import Ecto.Query
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+  @foreign_key_type :binary_id
 
   use Gearbox,
     field: :status,
@@ -288,10 +296,7 @@ defmodule MyApp.Sales.Order do
 
   def changeset(order, attrs) do
     order
-    |> cast(attrs, [
-      :customer_id, :organization_id, :tenant_id,
-      :status, :placed_at, :total_cents, :currency
-    ])
+    |> cast(attrs, [:customer_id, :organization_id, :tenant_id, :total_cents, :currency])
     |> validate_required([:customer_id, :status, :total_cents, :currency])
     |> validate_number(:total_cents, greater_than_or_equal_to: 0)
     |> cast_assoc(:line_items, with: &OrderLineItem.changeset/2)
@@ -334,8 +339,15 @@ defmodule MyApp.Sales.Order do
   # Child mutations route through the parent so the parent's invariants stay
   # in one place even though Ecto stores children in their own table.
   def add_line_item(order, attrs) do
-    new_item = Map.put(attrs, :subtotal_cents, attrs.quantity * attrs.unit_price_cents)
-    existing = Enum.map(order.line_items, &Map.from_struct/1)
+    quantity = Map.fetch!(attrs, :quantity)
+    unit_price_cents = Map.fetch!(attrs, :unit_price_cents)
+    new_item = Map.put(attrs, :subtotal_cents, quantity * unit_price_cents)
+
+    existing =
+      Enum.map(order.line_items, fn item ->
+        Map.take(item, [:id, :product_id, :sku, :quantity, :unit_price_cents, :subtotal_cents])
+      end)
+
     items = existing ++ [new_item]
 
     order
@@ -354,9 +366,13 @@ defmodule MyApp.Sales.Order do
 
   # only when Scope carries org/tenant:
   def visible_to(query \\ __MODULE__, %Scope{} = scope) do
+    scope_attrs = Map.from_struct(scope)
+    organization_id = Map.get(scope_attrs, :organization_id) || get_in(scope_attrs, [:organization, :id])
+    tenant_id = Map.fetch!(scope_attrs, :tenant_id)
+
     from o in query,
-      where: o.organization_id == ^scope.organization.id,
-      where: o.tenant_id == ^scope.tenant_id
+      where: o.organization_id == ^organization_id,
+      where: o.tenant_id == ^tenant_id
   end
 
   def preload_line_items(query \\ __MODULE__),
@@ -379,6 +395,9 @@ Lives alongside the parent under `sales/`, not under a separate `repo/` subtree.
 defmodule MyApp.Sales.OrderLineItem do
   use Ecto.Schema
   import Ecto.Changeset
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+  @foreign_key_type :binary_id
 
   alias MyApp.Sales.Order
 
@@ -465,7 +484,6 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     Repo.transact(fn ->
       with {:ok, command} <- validate(attrs),
            {:ok, order}   <- build_order(scope, command),
-           :ok            <- ensure_has_line_items(order),
            {:ok, placed}  <- Repo.insert(Order.place(order)),
            {:ok, _resv}   <- Inventory.reserve_stock(scope, %{order_id: placed.id}),
            {:ok, _pay}    <- Billing.authorize_payment(scope, %{order_id: placed.id, payment: command.payment}) do
@@ -512,23 +530,47 @@ end
 > controller or command that scheduled this job). Add a Policy call here only when the worker is
 > the first untrusted entry point.
 
-## Async cross-context entry point on a facade
+## Async cross-context entry point through a facade
 
 When another context needs to trigger work in this one asynchronously, expose an enqueue function
-on this context's facade — never let outsiders reach into `Workers.*` directly.
+on this context's facade — never let outsiders reach into `Workers.*` directly. Keep the facade
+thin by delegating to a command handler that validates attrs and builds the job.
 
 ```elixir
 defmodule MyApp.Sales do
+  alias MyApp.Sales.Commands.EnqueueFulfillment
+
+  defdelegate enqueue_fulfillment(scope, attrs), to: EnqueueFulfillment, as: :handle
+end
+```
+
+```elixir
+defmodule MyApp.Sales.Commands.EnqueueFulfillment do
+  alias MyApp.Accounts
+  alias MyApp.Accounts.Scope
   alias MyApp.Sales.Workers.FulfillOrderWorker
 
-  def enqueue_fulfillment(scope, attrs) do
-    %{
-      "scope" => Accounts.serialize_scope(scope),
-      "order_id" => Map.fetch!(attrs, :order_id),
-      "payment" => Map.fetch!(attrs, :payment)
-    }
-    |> FulfillOrderWorker.new()
-    |> Oban.insert()
+  def handle(%Scope{} = scope, attrs) when is_map(attrs) do
+    with {:ok, input} <- validate(attrs) do
+      %{
+        "scope" => Accounts.serialize_scope(scope),
+        "order_id" => input.order_id,
+        "payment" => input.payment
+      }
+      |> FulfillOrderWorker.new()
+      |> Oban.insert()
+    end
+  end
+
+  defp validate(attrs) do
+    order_id = Map.get(attrs, :order_id) || Map.get(attrs, "order_id")
+    payment = Map.get(attrs, :payment) || Map.get(attrs, "payment")
+
+    cond do
+      not is_binary(order_id) -> {:error, :invalid_order_id}
+      not is_map(payment) -> {:error, :invalid_payment}
+      true -> {:ok, %{order_id: order_id, payment: payment}}
+    end
   end
 end
 ```
@@ -599,7 +641,8 @@ defmodule MyApp.Repo.Migrations.CreateSalesOrders do
   use Ecto.Migration
 
   def change do
-    create table(:orders) do
+    create table(:orders, primary_key: false) do
+      add :id, :binary_id, primary_key: true
       add :customer_id, :binary_id
       add :organization_id, :binary_id  # only if multi-tenant
       add :tenant_id, :binary_id         # only if multi-tenant
@@ -610,7 +653,8 @@ defmodule MyApp.Repo.Migrations.CreateSalesOrders do
       timestamps()
     end
 
-    create table(:order_line_items) do
+    create table(:order_line_items, primary_key: false) do
+      add :id, :binary_id, primary_key: true
       add :order_id, :binary_id
       add :product_id, :binary_id
       add :sku, :string
@@ -632,3 +676,6 @@ end
 > One context per migration file. In greenfield contexts still in active build-out, it's acceptable
 > to fold related migrations together when the user requests it. In mature contexts, each schema
 > change gets its own dated migration.
+>
+> This migration matches the binary-id schema template. If the project uses integer ids, use the
+> existing generator convention instead of copying the binary-id primary key fields.

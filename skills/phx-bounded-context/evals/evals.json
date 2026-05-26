@@ -54,6 +54,30 @@
       "prompt": "Our Reviews.Commands.CreateReview handler has `defp load_workspace(scope), do: case Accounts.get_workspace(scope, %{id: scope.workspace_id}) do {:ok, ws} -> {:ok, ws}; {:error, :not_found} -> {:error, :workspace_not_found} end`. The workspace must exist for any authenticated scope. Is this idiomatic?",
       "expected_output": "Should flag this as defensive noise that fights the fail-fast convention. The workspace existence is an invariant (caller's scope already references it), so a bang lookup is clearer. Recommend either (a) `Accounts.get_workspace!(scope, %{id: scope.workspace_id})` from the facade and skipping the {:ok, _} wrap, or (b) if Accounts only exposes the non-bang version, calling it and pattern-matching `{:ok, ws}` directly without remapping the error. Should explain the rules: raise on invariant violations (use bang functions internally), return tagged tuples only for recoverable domain decisions, do NOT wrap bang results in {:ok, value}, do NOT manually re-throw `:not_found` tuples when a bang lookup is clearer. The public facade still returns tagged tuples for HTTP/LiveView pattern-matching — bang functions are for internal use.",
       "files": []
+    },
+    {
+      "id": 10,
+      "prompt": "Another context needs to enqueue Sales fulfillment work asynchronously. Can I put `FulfillOrderWorker.new(args) |> Oban.insert()` directly inside `Sales.enqueue_fulfillment/2`?",
+      "expected_output": "Should keep the facade thin. Expose `Sales.enqueue_fulfillment(scope, attrs)` as a defdelegate to a command handler such as `Sales.Commands.EnqueueFulfillment.handle/2`; the handler validates public attrs, serializes scope with the project Accounts helper, builds the Oban job, and inserts it. Outsiders never call `Workers.*` directly, and the facade does not build jobs or orchestrate logic.",
+      "files": []
+    },
+    {
+      "id": 11,
+      "prompt": "Our Phoenix project uses binary IDs. The generated schema has `field :customer_id, :binary_id` and the child has `belongs_to :order, Order`, but the migration uses `create table(:orders)` and `create table(:order_line_items)` with no binary primary key declarations. Is that OK?",
+      "expected_output": "Should flag the id mismatch. In a binary-id project, schemas should set `@primary_key {:id, :binary_id, autogenerate: true}` and `@foreign_key_type :binary_id` where appropriate, and migrations should use `create table(..., primary_key: false)` plus `add :id, :binary_id, primary_key: true`; child foreign keys should match the parent id type. Also say to mirror the existing project convention if it uses integer ids instead.",
+      "files": []
+    },
+    {
+      "id": 12,
+      "prompt": "I need a dashboard that displays an order from Sales together with invoice data from Billing. Should I put that cross-context composition in `Sales.Queries.GetOrder` or create a `Sales.Workflows.GetOrderDashboard`?",
+      "expected_output": "Should say queries do not call other context facades, and workflows are for internal multi-step domain processes driven by commands/workers, not read-only aggregation. For a one-off dashboard, compose `Sales.get_order(scope, %{id: id})` and `Billing.get_invoice(scope, attrs)` at the controller/LiveView boundary. If the read composition repeats or becomes performance-sensitive, introduce a dedicated read model/projection or reporting context with its own public API.",
+      "files": []
+    },
+    {
+      "id": 13,
+      "prompt": "The generated `PlaceOrder` command uses `cast_embed(:line_items, required: true)`, and the test expects an empty `line_items: []` payload to fail input validation. Is `required: true` enough?",
+      "expected_output": "Should say no: `required: true` ensures the embed field is present, but the command should also validate non-empty collections with `validate_length(:line_items, min: 1)` when an empty order is invalid. The handler test should assert `{:error, %Ecto.Changeset{}}` for an empty list, and should not include a duplicate precondition test for a case that input validation already rejects.",
+      "files": []
     }
   ]
 }

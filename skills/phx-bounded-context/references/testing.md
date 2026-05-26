@@ -71,12 +71,6 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 
       assert {:error, %Ecto.Changeset{}} = Sales.place_order(scope(), attrs)
     end
-
-    test "returns :empty_order from the precondition when line items become empty after validation" do
-      # Set up a case that passes input validation but fails the with-chain precondition.
-      # Often this isn't reachable when input validation already enforces non-empty; in that
-      # case, delete this test.
-    end
   end
 end
 ```
