@@ -1,25 +1,36 @@
 # Testing the Test Pyramid
 
-Generate tests at two main levels:
+Generate tests at three levels:
 
 ```
-Handler tests       Repo + transactions + scope + authorization + persistence + state transitions.
-                    For cross-context commands: real downstream contexts (no mocks) + rollback.
-Controller tests    HTTP behavior and response shape.
+Handler tests        Repo + input validation + state transitions + persistence.
+(commands/queries)   For cross-context commands: real downstream contexts (no mocks) + rollback
+                     when the command owns an atomicity boundary.
+                     Do NOT cover authorization here — that lives at the boundary.
+
+Workflow tests       Repo + orchestration + partial-failure rollback + cross-context coordination.
+                     Workflows are also exercised transitively through the commands/workers that
+                     invoke them; per-workflow tests focus on orchestration concerns.
+
+Boundary tests       HTTP / LiveView behavior, response shape, AND the authorization path
+(controller/LV)      (which scopes are allowed/denied, what status codes come back, what plugs
+                     reject).
 ```
 
-Cross-context behavior is not its own tier — it lives inside the originating command's handler
-tests, using real downstream contexts.
+Why the split? Authorization moved to the boundary (controllers/LiveViews/plugs), so handler tests
+no longer assert "unauthorized scope rejects." That test still exists — it just lives where the
+authz decision lives. This keeps handler tests focused on domain behavior and prevents the
+duplicate-authz-check trap.
 
-There's no fast pure-aggregate tier any more because there's no separate aggregate: the schema is
-the domain model, and exercising its transitions meaningfully requires the Repo. If your domain is
+There's no fast pure-aggregate tier because there's no separate aggregate: the schema is the
+domain model, and exercising its transitions meaningfully requires the Repo. If your domain is
 genuinely rich enough to warrant property-style operation-sequence testing, do it at the handler
 tier — see the optional aside at the bottom.
 
 ## Command/query handler test
 
-Repo-backed. Exercise authorization (allowed and denied scopes), validation failures, the happy
-path, the state transition, and persistence. Assert on the returned schema struct directly.
+Repo-backed. Exercise input validation failures, the happy path, the state transition, and
+persistence. Assert on the returned schema struct directly. **No authorization tests here.**
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrderTest do
@@ -27,8 +38,7 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 
   alias MyApp.Sales
 
-  defp scope(perms),
-    do: %MyApp.Accounts.Scope{permissions: perms, tenant_id: Ecto.UUID.generate()}
+  defp scope, do: %MyApp.Accounts.Scope{tenant_id: Ecto.UUID.generate()}
 
   describe "place_order/2" do
     test "places a valid order and returns the persisted schema" do
@@ -45,53 +55,40 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
         ]
       }
 
-      assert {:ok, order} = Sales.place_order(scope([:place_order]), attrs)
+      assert {:ok, order} = Sales.place_order(scope(), attrs)
       assert order.status == :placed
       assert order.total_cents == 1000
       assert is_struct(order, MyApp.Sales.Order)
       assert order.placed_at
     end
 
-    test "rejects an empty order via business precondition" do
+    test "rejects an empty order via input validation" do
       attrs = %{
         "customer_id" => Ecto.UUID.generate(),
         "currency" => "USD",
         "line_items" => []
       }
 
-      # input validation flags missing line_items before the precondition fires, so this
-      # surfaces as a changeset error from the handler's input embedded_schema
-      assert {:error, %Ecto.Changeset{}} = Sales.place_order(scope([:place_order]), attrs)
+      assert {:error, %Ecto.Changeset{}} = Sales.place_order(scope(), attrs)
     end
 
-    test "denies a scope without permission" do
-      attrs = %{
-        "customer_id" => Ecto.UUID.generate(),
-        "currency" => "USD",
-        "line_items" => [
-          %{
-            "product_id" => Ecto.UUID.generate(),
-            "sku" => "A1",
-            "quantity" => 1,
-            "unit_price_cents" => 100
-          }
-        ]
-      }
-
-      assert {:error, :unauthorized} = Sales.place_order(scope([]), attrs)
+    test "returns :empty_order from the precondition when line items become empty after validation" do
+      # Set up a case that passes input validation but fails the with-chain precondition.
+      # Often this isn't reachable when input validation already enforces non-empty; in that
+      # case, delete this test.
     end
   end
 end
 ```
 
-## Cross-context tests live in the command's test file
+## Cross-context tests live in the command's (or workflow's) test file
 
-When a command calls into other contexts (e.g. `Sales.place_order` calls `Inventory.reserve_stock`
-and `Billing.authorize_payment`), the cross-context paths are tested in the same
-`place_order_test.exs` file as the single-context paths — no separate test tier, no mocks. Drive
-the downstream contexts into the state you need (insufficient stock, payment that will fail) using
-their real public API, then assert both the bubbled error and that the earlier Sales write rolled
-back via the nested `Repo.transact`.
+When a command or workflow calls into other contexts (e.g. `Sales.place_order` calls
+`Inventory.reserve_stock` and `Billing.authorize_payment`), the cross-context paths are tested in
+the same file as the single-context paths — no separate test tier, no mocks. Drive the downstream
+contexts into the state you need (insufficient stock, payment that will fail) using their real
+public API, then assert both the bubbled error and that the earlier Sales write rolled back
+through the composing `Repo.transact`.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrderTest do
@@ -107,7 +104,7 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
       attrs = order_attrs(payment: invalid_card_attrs())
 
       assert {:error, :payment_declined} = Sales.place_order(scope, attrs)
-      # the order write must not survive the nested transaction's rollback
+      # the order write must not survive the composing transaction's rollback
       assert Repo.aggregate(Order, :count) == 0
     end
 
@@ -124,28 +121,100 @@ end
 ```
 
 > Reach for mocks only when a downstream call hits a real external system (e.g. a payment gateway
-> HTTP API). The cross-context call itself stays real — what gets stubbed is the system at the very
-> edge of the application.
+> HTTP API). The cross-context call itself stays real — what gets stubbed is the system at the
+> very edge of the application.
 
-## Controller test
+## Workflow test
 
-Verify status codes and response shape for success, validation error, not-found, and unauthorized.
+Repo-backed. The workflow trusts the caller has validated and authorized, so workflow tests
+**start from a validated attrs map** and focus on:
+
+- The orchestration sequence happens correctly.
+- Persistence side-effects land.
+- Partial failure rolls back (when the workflow owns a transaction).
+- Cross-context error tuples bubble verbatim.
+
+```elixir
+defmodule MyApp.Sales.Workflows.RunFulfillmentTest do
+  use MyApp.DataCase, async: true
+
+  alias MyApp.Repo
+  alias MyApp.Sales.Order
+  alias MyApp.Sales.Workflows.RunFulfillment
+
+  defp scope, do: build_scope()
+
+  describe "run/2" do
+    test "fulfills the order when Inventory and Billing both succeed" do
+      order = insert_order(status: :placed)
+      attrs = %{order_id: order.id, payment: valid_payment()}
+
+      assert {:ok, fulfilled} = RunFulfillment.run(scope(), attrs)
+      assert fulfilled.status == :fulfilled
+    end
+
+    test "rolls back the fulfillment when Billing declines" do
+      order = insert_order(status: :placed)
+      attrs = %{order_id: order.id, payment: invalid_payment()}
+
+      assert {:error, :payment_declined} = RunFulfillment.run(scope(), attrs)
+      assert Repo.reload!(order).status == :placed
+    end
+
+    test "raises when a required attrs key is missing (invariant violation)" do
+      assert_raise KeyError, fn ->
+        RunFulfillment.run(scope(), %{order_id: Ecto.UUID.generate()})  # missing :payment
+      end
+    end
+  end
+end
+```
+
+> A workflow's "missing required key" test is optional — it just documents that the workflow's
+> input contract is enforced via `Map.fetch!`. Skip it if it's noise.
+
+## Boundary test (controller / LiveView)
+
+Verify status codes and response shape for success, validation error, not-found, **and
+unauthorized**. This is where authz coverage now lives.
 
 ```elixir
 defmodule MyAppWeb.OrderControllerTest do
   use MyAppWeb.ConnCase, async: true
 
-  test "POST /orders returns 201 with the created order", %{conn: conn} do
-    conn = post(authed(conn), ~p"/orders", order: valid_order_params())
-    assert %{"status" => "placed"} = json_response(conn, 201)
+  describe "POST /orders" do
+    test "returns 201 with the created order for an authorized scope", %{conn: conn} do
+      conn = post(authed(conn, perms: [:place_order]), ~p"/orders", order: valid_order_params())
+      assert %{"status" => "placed"} = json_response(conn, 201)
+    end
+
+    test "returns 403 when the scope lacks :place_order permission", %{conn: conn} do
+      conn = post(authed(conn, perms: []), ~p"/orders", order: valid_order_params())
+      assert response(conn, 403)
+    end
+
+    test "returns 422 for an empty order", %{conn: conn} do
+      conn = post(authed(conn, perms: [:place_order]), ~p"/orders", order: empty_order_params())
+      assert json_response(conn, 422)["error"]
+    end
   end
 
-  test "POST /orders returns 422 for an empty order", %{conn: conn} do
-    conn = post(authed(conn), ~p"/orders", order: empty_order_params())
-    assert json_response(conn, 422)["error"]
+  describe "GET /orders/:id" do
+    test "returns 404 when the order does not exist", %{conn: conn} do
+      conn = get(authed(conn, perms: [:read_order]), ~p"/orders/#{Ecto.UUID.generate()}")
+      assert response(conn, 404)
+    end
+
+    test "returns 403 when the scope lacks :read_order permission", %{conn: conn} do
+      conn = get(authed(conn, perms: []), ~p"/orders/#{Ecto.UUID.generate()}")
+      assert response(conn, 403)
+    end
   end
 end
 ```
+
+> If authorization is enforced by a plug (not the controller action), put the 403 tests against
+> the pipeline rather than each action.
 
 ## Optional: property-style handler tests
 
