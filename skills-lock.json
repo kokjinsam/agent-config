@@ -1,11 +1,23 @@
 {
   "version": 1,
   "skills": {
+    "commit": {
+      "source": "kokjinsam/agent-config",
+      "sourceType": "github",
+      "skillPath": "skills/commit/SKILL.md",
+      "computedHash": "865ffe70381306ae40682be49c1d7787a2bb608ec29815b8b26c3d3463ccdb12"
+    },
     "skill-cleaner": {
       "source": "steipete/agent-scripts",
       "sourceType": "github",
       "skillPath": "skills/skill-cleaner/SKILL.md",
       "computedHash": "c3b9bb9f2e7d6290924498ede6cd797346135b8b74327359717686a34240b0af"
+    },
+    "write-a-skill": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/write-a-skill/SKILL.md",
+      "computedHash": "b44d8aab2ead83c716e01af4c9a24ccc4575ce70ad58ec4f1749fb88c9cc82ba"
     }
   }
 }
