@@ -1,0 +1,22 @@
+Give me a Codex goal prompt to implement this PRD.
+
+- One issue = one subagent = one loop (implement -> review -> fix)
+- Issues should be implemented sequentially.
+- There should be a loop circuit breaker.
+- Parent Codex is an orchestrator making sure all issues are implemented.
+- Per issue:
+    - Spawn one implementation subagent:
+        - GPT-5.5, medium reasoning.
+        - Use tdd and phx-bounded-context skills
+        - Implements only the active issue.
+        - Keeps scope narrow and reports files changed, tests run, residual risks.
+        - Use TLA+ spec as source of truth and architecture docs as explainer.
+    - Spawn one separate review subagent:
+        - GPT-5.5, high reasoning.
+        - Use code-review-and-quality skill
+        - Reviews only the active issue diff.
+        - Reports severity-ordered findings with file/line refs.
+        - Does not edit files.
+- Commit after completing each issue.
+- Prompt must be 3,000 characters or fewer.
+- No human intervention needed during the loop.
