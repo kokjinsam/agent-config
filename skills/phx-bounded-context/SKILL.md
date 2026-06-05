@@ -1,232 +1,290 @@
 ---
 name: phx-bounded-context
 description: >
-  Scaffold, change, or review rich Elixir/Phoenix bounded contexts with scope-first APIs, thin
-  facades, command/query handlers, internal workflows/Oban workers, Ecto schemas as Gearbox
-  state-machine domain models, boundary authorization, cross-context facade calls, and Repo-backed
-  tests.
+  Scaffold, change, or review rich Elixir/Phoenix bounded contexts from TLA+ specs first,
+  with thin public facades, deliberately public command/query handlers, noun-named internal
+  orchestration modules, Ecto schemas as Gearbox state-machine domain models, Flop-backed
+  collection queries, boundary authorization outside the context, facade-only cross-context calls,
+  and Repo-backed tests.
 ---
 
-# Phoenix Bounded Context — State Machines, CQRS-Style Handlers, Workflows, Ecto Schemas
+# Phoenix Bounded Context — Spec-First, Thin Facades, Ecto Domain Models
 
-This skill implements bounded contexts on top of Phoenix and Ecto idioms with clear boundaries
-without fighting the framework: a thin public facade, self-contained command/query handlers,
-**internal workflows** for orchestration driven by workers or commands, and Ecto schemas that ARE
-the domain model (Gearbox state machines, changesets, and intention-revealing transition functions
-live on the schema itself — there's no separate in-memory aggregate alongside).
+This skill implements Phoenix/Ecto bounded contexts without fighting the framework. Use TLA+
+specs as the source of truth when they exist, architecture docs as explainers, and the codebase's
+existing conventions as local style guidance. The bounded context contains the domain model and
+domain API; HTTP/LiveView authorization is lifted above it.
 
-## When this architecture is worth it
+The shape is intentionally conservative:
 
-This structure earns its overhead only when the domain has **meaningful business behavior**: real
-invariants, state-machine lifecycles, money/totals, tenant or permission boundaries, or multi-step
-business rules that must stay consistent. Decide heuristically per context:
+- a thin public context facade;
+- public command/query handlers only when the operation is a necessary and important boundary API;
+- internal orchestration modules named with precise domain nouns, not a `Workflows.*` convention;
+- Ecto schemas as the domain model, including Gearbox state machines, changesets, transition
+  functions, `build!/1`, and query fragments;
+- collection reads, filtering, ordering, and pagination through Repo-level Flop helpers.
 
-- **Rich domain** (invariants, a state machine, multi-tenancy, things that must stay consistent) →
-  apply the full structure below.
-- **Simple CRUD** (admin panel, basic record management, reporting) → say so plainly and recommend a
-  lighter vanilla Phoenix context with plain Ecto schemas. Don't force these patterns where they
-  don't pay for themselves; flag the recommendation rather than silently scaffolding everything.
+## Source-of-Truth Order
 
-When in doubt, name the trade-off for the user and let them choose.
+Before generating, changing, or reviewing bounded-context code:
 
-## What this skill does
+1. Read relevant `docs/specs/*.tla` files first, if present. Treat them as the source of truth for
+   entities, states, transitions, invariants, commands, allowed reads, and ownership boundaries.
+2. Read architecture docs, ADRs, and `CONTEXT.md` as explainers. Use them to translate terminology,
+   discover rationale, and identify drift, but do not let stale prose override the spec.
+3. Inspect the current codebase for style: app namespace, Repo module, Scope struct, id type,
+   timestamp type, JSON shaping, worker conventions, tests, and existing context layout.
+4. Ask the user only for decisions the specs/docs/code do not settle. Do not ask obvious questions
+   that the TLA+ model already answers.
 
-Four modes — infer which from the request:
+When specs and architecture docs disagree, say that plainly and anchor the implementation or review
+on the TLA+ model unless the user explicitly directs otherwise.
 
-1. **Scaffold a new context** — generate the full tree (facade, commands, queries, workflows when
-   needed, schemas with Gearbox, workers, migration, full test pyramid) from a domain description.
-2. **Add an operation** — add a single command, query, or workflow (plus the schema transition
-   function and tests) to an existing context, following its established conventions.
-3. **Review / refactor** — audit existing code against the rules here and fix violations. See the
-   "Review mode" section below for what to auto-fix vs flag.
-4. **Explain / guide** — answer how-to questions and point to the right layer without necessarily
-   writing code.
+## When This Architecture Is Worth It
 
-## Before generating: detect the project
+This structure earns its overhead only when the domain has meaningful behavior: real invariants,
+state-machine lifecycles, money/totals, tenant boundaries, cross-context coordination, or
+multi-step business rules that must stay consistent.
 
-Read the codebase first so generated code fits in, then confirm once before scaffolding:
+- **Rich domain**: apply the full structure below.
+- **Simple CRUD**: recommend a lighter vanilla Phoenix context with plain Ecto schemas. Do not
+  force commands, query handlers, orchestration modules, or Gearbox where they do not pay for
+  themselves.
 
-- **App namespace** — from `mix.exs` (`:app`) and the `lib/` tree (e.g. `MyApp`, `MyApp.Repo`).
-- **Scope module** — find the existing `Scope` struct (often `MyApp.Accounts.Scope`). **Inspect its
-  fields** — this drives multi-tenancy (below).
-- **Authorization style** — does the codebase use a `Policy` module per context, plugs, LiveView
-  checks, or some mix? Mirror what's there; Policy is opt-in (see Rule 9).
-- **JSON shaping** — Phoenix 1.7 JSON view modules, custom serializers, JSONAPI? Mirror the
-  existing pattern; do not impose one.
-- **Conventions** — look at 2–3 existing contexts/schemas and mirror their patterns (test style,
-  naming, `timestamps` type, id type) even where they differ from the templates here. Consistency
-  with the codebase beats matching this skill verbatim.
+When in doubt, name the trade-off and let the user choose.
 
-Show the user the detected app prefix, Scope module, Repo, and authz style for a single
-confirmation, then build.
+## What This Skill Does
 
-For full code templates for every module, read `references/templates.md`. For the test pyramid
-(handler/workflow/controller tests), read `references/testing.md`.
+Infer the mode from the request:
 
-## The layers and where things live
+1. **Scaffold a new context**: generate the facade, necessary public command/query handlers,
+   internal noun-named orchestration modules when needed, schemas, workers, migrations, and tests.
+2. **Add an operation**: add one public command/query or one internal orchestration module, plus
+   schema functions and tests.
+3. **Review / refactor**: audit existing code against these rules and fix hard violations.
+4. **Explain / guide**: answer how-to questions and point to the right layer.
+
+For full code templates, read `references/templates.md`. For the test pyramid, read
+`references/testing.md`.
+
+## Before Generating: Detect The Project
+
+Read the codebase first so generated code fits in:
+
+- **App namespace** from `mix.exs` and `lib/` (for example `MyApp`, `MyApp.Repo`).
+- **Scope module** and fields, often `MyApp.Accounts.Scope`. Scope fields drive tenancy and audit
+  attribution.
+- **Authorization style at the boundary**: plugs, controller helpers, LiveView hooks, or web-layer
+  policy modules. Authorization is not part of the bounded context.
+- **Repo conventions**, including whether helper functions such as `Repo.transact/1` already exist
+  and whether Flop is installed.
+- **JSON shaping**: Phoenix 1.7 JSON modules, custom serializers, JSONAPI, etc.
+- **Conventions** from 2-3 existing contexts/schemas: test style, naming, id type, timestamp type,
+  migrations, worker serialization.
+
+Show the user the detected app prefix, Scope module, Repo, boundary authorization style, and
+relevant source-of-truth files for confirmation before scaffolding substantial new code.
+
+## The Layers And Where Things Live
 
 ```
 lib/my_app/
-  sales.ex                          # Thin public facade — defdelegate only
+  sales.ex                         # Thin public facade — defdelegate only
   sales/
-    commands/place_order.ex         # Write use case (user/system intent): validate, transact, persist
-    queries/get_order.ex            # Read use case: validate, filter, fetch
-    workflows/run_fulfillment.ex    # Internal orchestration; called by commands or workers
-    workers/*.ex                    # Oban jobs; rebuild scope, call ONE workflow (or command)
-    order.ex                        # Ecto schema + Gearbox + changesets + transition functions
-    order_line_item.ex              # Child Ecto schema
-    policy.ex                       # OPTIONAL — only when the context has non-trivial authz
+    commands/place_order.ex        # Public write API, only when truly needed
+    queries/get_order.ex           # Public read API, only when truly needed
+    queries/list_orders.ex         # Public collection read, Flop-backed
+    orders.ex                      # Internal orchestration around Order
+    order_verification.ex          # Internal orchestration when plural noun is not precise
+    workers/*.ex                   # Oban jobs; rebuild scope, call one public API or internal orchestrator
+    order.ex                       # Ecto schema + Gearbox + changesets + transitions + query fragments
+    order_line_item.ex             # Child Ecto schema
 ```
 
-| Layer                  | Owns                                                                                                                                                       | Never                                                                                       |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `MyApp.Sales` (facade) | Public API shape, `defdelegate`                                                                                                                            | Transactions, orchestration, business rules                                                 |
-| `Commands.*`           | Input validation (embedded_schema), atomicity boundaries, business preconditions in the `with` chain, call schema transition functions, persist            | Authorization (caller does it), reaching into other contexts' internals                     |
-| `Queries.*`            | Input validation, compose schema query fragments, execute via `Repo`, return schema preloaded as needed                                                    | Mutations, calling other contexts                                                           |
-| `Workflows.*`          | Internal multi-step orchestration: schema transitions, `Repo` writes, queries, cross-context calls. Atomicity when needed.                                 | Public exposure (not on facade), input validation, authorization (caller does both)         |
-| `Order` (Ecto schema)  | `schema "..."`, Gearbox state machine, changesets, transition functions that return changesets, `build!/1` for in-memory structs, query fragments          | Calling `Repo`, calling other contexts, cross-context `belongs_to`                          |
-| `Workers.*`            | Rebuild `%Scope{}` from serialized job args; call one workflow (preferred) or command; queue/retry/operational metadata                                    | Business logic, bypassing facade for cross-context, duplicating domain rules                |
-| `Sales.Policy` (opt-in)| Authorization decisions, called from controllers/LiveViews (or workers when truly needed)                                                                  | Persistence, domain logic, being called from inside handlers (commands/workflows/queries)   |
+Do not create `workflows/` or `Workflows.*` modules. Internal orchestration modules live directly
+under the context namespace and are named with ubiquitous-language nouns.
 
-## Core rules
+| Layer | Owns | Never |
+| --- | --- | --- |
+| `MyApp.Sales` facade | Public API shape, `defdelegate` | Transactions, orchestration, business rules, authorization |
+| `Commands.*` | Necessary public write use cases: input validation, atomicity, business preconditions, schema transitions, persistence | Authorization, generic internal steps, reaching into other contexts' internals |
+| `Queries.*` | Necessary public read use cases: input validation, scoped query composition, Flop-backed collection reads, result preloads | Mutations, authorization, cross-context composition |
+| Internal noun modules | Multi-step same-context or cross-context orchestration that is not itself a public command/query | Generic names, dedicated workflow folder, public exposure by default |
+| Ecto schemas | Tables, Gearbox, changesets, transition functions returning changesets, `build!/1`, query fragments, `@derive Flop.Schema` for listed schemas | `Repo` calls, other-context calls, cross-context `belongs_to` |
+| Workers | Operational entry points: rebuild `%Scope{}`, call one public API or internal noun module, queue/retry metadata | Business logic, authorization logic, bypassing another context's facade |
+| Controllers/LiveViews/plugs | Request shaping, authorization, response shaping, calling the facade | Domain logic, direct Repo access for context records |
 
-### 1. Scope is the first argument
+## Core Rules
+
+### 1. Scope Is The First Argument
 
 Every public function whose result or side effect depends on actor, workspace, organization,
-tenant, permissions, visibility, audit attribution, or tenant scoping takes `%Scope{}` first and
-an attrs map second. The scope represents the caller/execution boundary, not just the current user.
-For genuinely system-level work, pass an explicit system scope rather than bypassing the pattern —
-and never add a blanket "system can do everything" shortcut unless an ADR explicitly defines it.
+tenant, visibility, audit attribution, or tenant scoping takes `%Scope{}` first and an attrs map
+second. Scope represents the caller/execution boundary, not just the current user.
 
 ```elixir
-Sales.place_order(scope, attrs)   # not Sales.place_order(attrs, user)
-Sales.get_order(scope, attrs)     # not Sales.get_order(id) — pass %{id: id}
+Sales.place_order(scope, attrs)
+Sales.get_order(scope, %{id: id})
+Sales.list_orders(scope, params)
 ```
 
-Both scoped commands and queries take `(scope, attrs)`. Even single-id reads pass a map
-(`Sales.get_order(scope, %{id: id})`) so every handler validates input and adding a field later
-(filters, preloads, options) never changes the call shape. Pre-scope Auth operations that establish
-identity before a trusted scope exists may omit `%Scope{}` but still use handler functions named
-`handle` and should prefer attrs maps for external input.
+Use an explicit system scope for system-level work. Do not add a blanket "system can do
+everything" shortcut unless an ADR or spec defines it.
 
-Public handler attrs carry IDs and options by default, not caller-loaded Ecto structs. The handler
-loads referenced records only when the operation needs the record for visibility, preconditions,
-locking, derived data, or return shape; IDs that are just durable references may stay IDs.
+Both scoped commands and queries take `(scope, attrs_or_params)`. Even single-id reads pass a map
+so every handler validates input and adding fields later never changes the call shape.
 
-### 2. The facade is thin
+Pre-scope Auth operations that establish identity before a trusted scope exists may omit `%Scope{}`
+but still prefer attrs maps for external input.
 
-The public context module delegates and nothing more. A boring facade is a feature — it's the stable
-surface controllers, LiveViews, workers, and use cases depend on. Workflows are NOT exposed on the
-facade; they're internal.
+### 2. The Facade Is Thin And Deliberate
+
+The public context module delegates and nothing more. It exposes only commands and queries that are
+necessary and important boundary APIs. Do not scaffold default CRUD functions just because an
+entity exists.
 
 ```elixir
 defdelegate place_order(scope, attrs), to: PlaceOrder, as: :handle
 defdelegate get_order(scope, attrs), to: GetOrder, as: :handle
 ```
 
-### 3. Name public commands in ubiquitous language
+Before adding a facade function, consult TLA+ specs and architecture docs:
 
-Public **command** functions use the domain's verbs, not CRUD: `place_order`, `cancel_order`,
-`ship_shipment` — never `create_order`/`update_order`/`delete_order`. Before naming, **ask the user
-for the context's glossary / ubiquitous language** if it isn't already clear from the conversation
-or codebase; the names are the API and should match how the business talks. **Queries may stay
-`get_`/`list_`/`find_`** — reads are less domain-charged and the conventional names read clearly.
+- Is this operation modeled as an external/domain action or required read?
+- Does a controller, LiveView, worker, or another context legitimately need it?
+- Would exposing it leak an internal step or unstable implementation detail?
 
-**Refuse generic names during scaffold.** If the user asks to scaffold a command/schema/workflow
-named `run`, `process`, `record`, `item`, or similar, pause and ask for the domain-specific name
-with examples from the ubiquitous language (`intake_run` over `run`, `evidence_item` over `item`).
+If the answer is no, keep the behavior internal as a schema function, query fragment, or
+ubiquitous-language orchestration module.
 
-**Keep the domain noun on operation modules.** `Sales.Commands.PlaceOrder`, not
-`Sales.Commands.Place`; `Reviews.Workflows.RunIntake`, not `Reviews.Workflows.Run`. These names
-appear in stack traces, telemetry, and logs where the parent namespace is lost. The "drop redundant
-prefix" rule (see the "Naming: redundant prefixes" section below) applies to leaf schemas and enums only.
+### 3. Commands And Queries Are Public API Labels
 
-### 4. Handlers are self-contained (and authorization-trusted)
+`Commands.*` and `Queries.*` are for operations exposed through the context facade. Do not use
+those folders as generic buckets for every write/read module.
 
-A command or query handler owns one use case end to end for one context: input validation, any
-required transaction boundary, **business preconditions in the `with` chain**, calling schema
-transition functions (or a workflow when orchestration is needed), persisting through `Repo`, and
-returning a result.
+Public command functions use the domain's verbs, not CRUD: `place_order`, `cancel_order`,
+`submit_protocol_amendment`, `accept_retrieved_full_text`. Before naming, consult TLA+ action
+names, architecture docs, and code vocabulary. Ask the user for a glossary only when the sources
+do not settle the language.
 
-Handlers **trust the caller to have authorized** (see Rule 9). They do not call `Policy.authorize`
-themselves. They also do not load Scope-derived authz state; they assume the scope passed in is
-allowed to execute this operation.
+Queries may use `get_`, `list_`, or `find_` when they are genuinely public reads. A public
+`list_*` function must have a real boundary use case; do not scaffold it by default.
 
-For complex or external/string-keyed input, handlers own an **input schema** as an
-`embedded_schema` defined in the handler module itself; for tiny `%{id: id}`-style inputs, an
-explicit private validation helper is fine. If a handler seems to need several unrelated input
-schemas, split it into multiple handlers before nesting input modules.
+Refuse generic names during scaffold. If the user asks for `run`, `process`, `record`, `item`,
+`sync`, or similar, pause and ask for the domain-specific name with examples from the ubiquitous
+language.
 
-Business rules live here. Schema-level transition functions (e.g. `Order.place/1`) handle the
-state-machine transition and structural changeset; the handler is responsible for checking
-cross-field preconditions like "must have at least one line item" or "payment must be authorized"
-before calling the transition. This keeps the schema functions reusable and keeps use-case rules
-visible at the handler level.
+Keep the domain noun on public operation modules: `Sales.Commands.PlaceOrder`, not
+`Sales.Commands.Place`. These names appear in stack traces, telemetry, and logs where the parent
+namespace is often lost.
 
-### 5. One schema per entity; `build!/1` is for in-memory structs only
+### 4. Authorization Is Outside The Bounded Context
 
-Don't create a parallel in-memory representation of a persisted schema. There is no separate
-"aggregate" `embedded_schema` that mirrors the Ecto schema — the Ecto schema **is** the domain
-model. It owns the state machine, the changesets, the transition functions, and the query
-fragments.
+Authorization is not part of the bounded context. Controllers, LiveViews, plugs, pipelines,
+GraphQL resolvers, or web-layer policy modules authorize before calling the context facade.
 
-Two construction patterns coexist by role:
+Bounded-context modules trust the caller has already authorized:
 
-- **`Schema.changeset(struct, attrs)`** — for persisted entities. The handler casts external/
-  trusted attrs through the changeset and lets `Repo.insert`/`Repo.update` execute it.
-  Normalization (downcasing, trimming, defaults via `put_change`) for persisted fields lives in
-  the changeset.
+- Facades do not authorize.
+- Commands do not call `Policy.authorize`.
+- Queries do not call `Policy.authorize`.
+- Internal orchestration modules do not call `Policy.authorize`.
+- Schemas and workers do not own authorization rules.
 
-- **`Schema.build!(attrs)`** — for **non-persisted** in-memory structs (event payloads, value
-  objects, internal attrs-shaped structs that get passed between modules). Uses `Map.fetch!` for
-  required keys and raises on missing ones, because the caller's contract guarantees them. Don't
-  use `build!/1` to skip the changeset for things that will be persisted.
+Do not scaffold `MyApp.Sales.Policy` or any policy module under the context. If the project has a
+policy convention, keep it in the boundary layer and match its existing location, such as
+`MyAppWeb.SalesPolicy`, controller helpers, plugs, or LiveView hooks.
+
+Scoped queries still enforce data scoping through query construction such as `visible_to/2`. That
+is tenancy/visibility filtering, not authorization.
+
+### 5. Handlers Are Self-Contained
+
+A public command or query handler owns one boundary use case end to end for one context:
+input validation, any transaction boundary, business preconditions in the `with` chain, schema
+transition functions, persistence/query execution, and return shape.
+
+For complex or external/string-keyed input, handlers own an `embedded_schema` input schema inside
+the handler module. For tiny `%{id: id}` input, an explicit private validation helper is fine. If a
+handler seems to need several unrelated input schemas, split it into multiple public operations or
+move internal steps to noun-named modules.
+
+Business rules live in handlers or internal orchestration modules. Schema transition functions
+handle the legal state transition and structural changeset. Cross-field/domain preconditions like
+"must have at least one line item" or "payment must be authorized" stay visible in the use-case
+flow before the transition is persisted.
+
+### 6. Internal Orchestration Uses Ubiquitous-Language Noun Modules
+
+There is no `Workflows.*` convention. Internal orchestration modules are direct children of the
+context namespace and are named after the domain concept they coordinate:
 
 ```elixir
-def build!(attrs) do
-  %__MODULE__{
-    workspace_id: Map.fetch!(attrs, :workspace_id),
-    review_id: Map.fetch!(attrs, :review_id)
-  }
+defmodule MyApp.Sales.Orders do
+  # orchestration around Order
+end
+
+defmodule MyApp.Sales.OrderVerification do
+  # orchestration where "Orders" is too broad
 end
 ```
 
-Splitting in-memory and persistence schemas grows mapping code and lets the two drift; one schema
-per entity keeps the model honest.
+Use the plural schema noun when it accurately names the coordinated behavior: `Orders`,
+`Subscriptions`, `RetrievalAttempts`. If the plural noun is vague, choose a descriptive domain noun
+from the TLA+ spec and architecture docs: `OrderVerification`, `FullTextCapture`,
+`ProtocolActivation`, `ScreeningRecordAudit`.
 
-### 6. Schemas own domain behavior
+Do not use generic nouns such as `Processor`, `Manager`, `Runner`, `Workflow`, `Orchestrator`, or
+`Service`. Do not nest orchestration under the schema namespace unless the existing codebase
+already has that convention.
 
-The Ecto schema is where the domain lives. It owns:
+Use an internal noun module when:
 
-- The `schema "..."` definition (fields, associations, timestamps).
-- The Gearbox state machine.
-- Changesets (structural validation, normalization, defaults, formatting).
-- Transition functions that return changesets, e.g.:
+- an Oban worker needs to drive multi-step domain behavior;
+- more than one public command needs the same domain sequence;
+- the sequence coordinates multiple schemas or contexts;
+- the operation is an internal domain step that should not be exposed on the facade.
 
-  ```elixir
-  def place(order) do
-    order
-    |> change(placed_at: DateTime.utc_now() |> DateTime.truncate(:second))
-    |> Gearbox.transition(:placed)
-  end
-  ```
+Internal orchestration modules may call own schemas, own public query handlers when appropriate,
+own schema query fragments, `Repo`, and other contexts' facades. They take `%Scope{}` first when
+scope matters, then a validated attrs map or a small explicit argument set. They may use
+`Map.fetch!` for required keys when the caller contract has already validated the input.
 
-- `build!/1` for in-memory variants (Rule 5).
-- Query fragments (`by_id/2`, `for_customer/2`, `visible_to/2`, `preload_line_items/1`,
-  `lock_for_update/1`) — returning `Ecto.Query`, not executing.
+### 7. One Schema Per Entity; `build!/1` Is For In-Memory Structs Only
 
-The schema does **not** call `Repo`; the handler or workflow does. Construct persisted entities
-with `Order.changeset(%Order{}, attrs)` directly — no `new/1` wrapper, no separate aggregate struct.
+Do not create a parallel in-memory representation of a persisted schema. The Ecto schema is the
+domain model: it owns the state machine, changesets, transition functions, and query fragments.
 
-Children are `has_many` associations (separate schemas). Child mutations route through the parent
-schema via functions like `Order.add_line_item(order, attrs)` that build a changeset with
-`cast_assoc`. The parent owns the consistency boundary for its children's lifecycle decisions even
-though Ecto stores them in their own table.
+Two construction patterns coexist by role:
 
-### 7. State machines use Gearbox when there's a status field
+- `Schema.changeset(struct, attrs)` for persisted entities. Handlers cast external/trusted attrs
+  through the changeset and let `Repo.insert` / `Repo.update` execute it.
+- `Schema.build!(attrs)` for non-persisted in-memory structs such as event payloads and value
+  objects. Use `Map.fetch!` for required keys because the caller contract guarantees them.
 
-If an entity has a `status` field with multiple values, **use Gearbox**. A status field without an
-FSM is a code smell — transitions become scattered guards. Wire it directly on the schema:
+Do not use `build!/1` to skip the changeset for data that will be persisted.
+
+### 8. Schemas Own Domain Behavior
+
+The Ecto schema owns:
+
+- `schema "..."`;
+- Gearbox state machine when there is a lifecycle/status field;
+- changesets, structural validation, normalization, defaults;
+- transition functions that return changesets;
+- `build!/1` for non-persisted variants;
+- query fragments returning `Ecto.Query`;
+- `@derive Flop.Schema` when the schema participates in public collection reads.
+
+The schema does not call `Repo`, other contexts, workers, or authorization code.
+
+Child entities are separate schemas in the same context. Child mutations route through the parent
+schema when the parent owns the consistency boundary, usually via `cast_assoc`.
+
+### 9. State Machines Use Gearbox When There Is A Status Field
+
+If an entity has a `status` field with multiple values, use Gearbox. A status field without an FSM
+is a smell because transitions become scattered guards.
 
 ```elixir
 use Gearbox,
@@ -236,275 +294,174 @@ use Gearbox,
   transitions: %{draft: [:placed, :cancelled], placed: [:cancelled]}
 ```
 
-Gearbox guards the **legal transition graph** — `draft -> placed` allowed, `cancelled -> placed`
-rejected. Transition functions on the schema are thin: apply the Gearbox transition and any
-structural side effects (setting `placed_at`, etc.) and return a changeset.
+Do not invent a status field just to use Gearbox. Use it when it clarifies a real lifecycle.
 
-**Inverse:** don't *invent* a status field just to use Gearbox. If the entity doesn't naturally
-have a lifecycle, plain functions and explicit field checks are clearer. FSM machinery should
-clarify allowed transitions, not be ceremony.
+### 10. Collection Queries And Pagination Use Flop
 
-**Cross-field business preconditions** — "must have at least one line item to place", "must have
-an authorized payment to ship" — live in the **handler's `with` chain**, not in the transition
-function or changeset:
+All public list/search/filter/sort/pagination reads use Repo-level Flop helpers. Add them to the
+project Repo if absent:
 
 ```elixir
-with {:ok, command} <- validate(attrs),
-     {:ok, order}   <- load_order(scope, command.order_id),
-     :ok            <- ensure_has_line_items(order),       # ← business precondition
-     {:ok, placed}  <- Repo.update(Order.place(order)) do
-  {:ok, placed}
+def paginate(queryable, params, opts \\ []) do
+  Flop.validate_and_run(queryable, params, opts)
+end
+
+def list(queryable, params, opts \\ []) do
+  with {:ok, flop} <- Flop.validate(params, opts) do
+    results =
+      queryable
+      |> Flop.filter(flop, opts)
+      |> Flop.order_by(flop, opts)
+      |> all()
+
+    {:ok, results}
+  end
 end
 ```
 
-### 8. `embedded_schema` is for handler input only
-
-`embedded_schema` is the right tool for complex or external/string-keyed handler input. Use it on
-every command unless the input is a tiny already-normalized shape (a single `%{id: id}` validated
-inline is fine). It is **not** for parallel in-memory representations of persistence schemas — that
-re-introduces the duplication Rule 5 forbids. Internal in-memory structs use `build!/1` (Rule 5).
-
-### 9. Authorization lives at the boundary; `Policy` is opt-in
-
-Authorization happens at the **calling boundary**, not inside handlers:
-
-- **Controllers / LiveViews** authorize before dispatching to a command or query (a plug, a
-  pipeline check, or an explicit call in the action/event handler).
-- **Workers** authorize when they're entry points that don't come from an already-authorized
-  context (rare — usually the work was authorized at enqueue time).
-
-Commands, workflows, and queries **trust the caller has already authorized**. They do not call
-`Policy.authorize`. This keeps domain handlers focused on domain logic and avoids the surprise of
-the same authz decision running twice (once at the controller, once at the handler) with subtly
-different inputs.
-
-The `MyApp.Sales.Policy` module is **opt-in**, not scaffolded by default. Many contexts won't have
-one — a plug or a controller-level check is enough. Add a Policy module when the context has
-non-trivial authz (action-specific permission checks, resource-level rules) that the boundary needs
-a domain-shaped place to call.
-
-When you do generate a Policy:
+Every schema used by public collection reads must define a proper `@derive Flop.Schema`, including
+only fields the boundary should allow filtering/sorting on. Keep private, sensitive, or unstable
+fields out of the derive.
 
 ```elixir
-@spec authorize(Scope.t(), atom(), map()) :: :ok | {:error, :unauthorized}
-def authorize(%Scope{} = scope, :place_order, _params) do
-  if :place_order in scope.permissions, do: :ok, else: {:error, :unauthorized}
+@derive {
+  Flop.Schema,
+  filterable: [:status, :customer_id],
+  sortable: [:inserted_at, :status],
+  default_order: %{order_by: [:inserted_at], order_directions: [:desc]}
+}
+schema "orders" do
+  # ...
 end
 ```
 
-Policy lives in the context but is called *from* the boundary. Scoped queries still enforce
-ordinary visibility through `visible_to/2` query construction — that's not authorization, that's
-data scoping.
+This rule applies to collection reads, not single-record identity lookups. A `get_order(scope,
+%{id: id})` query may use `Repo.one` / `Repo.get_by` against a scoped query. Do not force Flop
+onto single-id reads unless the project already does.
 
-### 10. Errors: fail-fast for invariants, tagged tuples for recoverable
+### 11. Queries Return Schemas By Default
 
-Fail-fast when the contract already guarantees the happy path; return tagged tuples only when the
-caller is genuinely expected to branch.
+A query handler returns Ecto schema structs by default. Preloads are explicit per call. Do not
+deep-preload everything by default.
 
-- **Raise (invariant violation)** — missing required attrs after validation, lookups whose
-  existence is assumed, programmer-bug states. Use bang functions: `Repo.get!`, `Map.fetch!`,
-  internal `Sales.get_order!/2`, schema `build!/1`.
-- **Return `{:error, atom}` (recoverable)** — `:unauthorized`, `:not_found` for a user-supplied
-  id, `:invalid_transition`, `:insufficient_funds`, `:empty_order`. Domain decisions the caller
-  must branch on.
-- **Return `{:error, %Ecto.Changeset{}}`** — input/persistence validation failures.
+Queries do not call other context facades. Cross-context read composition lives at the
+controller/LiveView boundary, in an explicit read model/projection, or in a separate reporting
+context with its own public API.
+
+Introduce flat read models when the read is clearly display-only, repeated, or
+performance-sensitive. Do not hide cross-context read composition inside a query or internal
+orchestration module.
+
+### 12. Return Shapes Use Domain-Shaped Values
+
+Public APIs should return persisted schemas, domain structs, or explicit result structs. Prefer
+virtual fields on the schema when a command result naturally extends the domain object, such as a
+presigned URL on an upload.
+
+Anonymous maps from public command APIs are a violation. JSON shaping belongs in web JSON modules
+or serializers, not command return values and not directly in controllers.
+
+### 13. Repo Transactions Live Where Atomicity Is Needed
+
+Use `Repo.transact/1` or the project's equivalent when the operation has a real atomicity boundary:
+multiple dependent writes, a domain write plus job/audit/projection enqueue, locks and state
+transitions, or cross-context coordination that must be all-or-nothing.
+
+Do not wrap a single independent insert/update in a transaction by convention alone. Each public
+command or internal orchestration module owns its own atomicity decision. Nested transactions via
+savepoints are acceptable when each layer has its own atomic concern.
+
+### 14. Cross-Context Calls Go Through Facades
+
+Always call another context's public facade. Never call another context's `Commands.*`,
+`Queries.*`, internal noun modules, `Workers.*`, or schemas.
+
+| Layer | Can call other-context facades? |
+| --- | --- |
+| Public commands | Yes |
+| Internal noun orchestration modules | Yes |
+| Workers | Prefer no; call one public API or internal noun module in their own context |
+| Public queries | No |
+| Schemas | No |
+| Boundary auth modules | No domain composition |
 
 Rules:
 
-- Do **not** wrap bang results in `{:ok, value}` — they raise on failure and return the value on
-  success.
-- Do **not** manually throw `:not_found` tuples when a bang lookup is clearer.
-- Bang functions are **internal** (used in handlers/workflows/schemas). The public **facade always
-  returns tagged results** so HTTP/LiveView callers can pattern-match without `try`/`rescue`.
-- Avoid broad `rescue _`/`catch` blocks around domain calls unless there's a documented recovery
-  path.
+- Pass the same `%Scope{}` through.
+- Let downstream error tuples bubble unless the TLA+ spec or public API contract requires a
+  translation.
+- Returning the called schema is acceptable when that is the natural domain result.
+- Use Phoenix.PubSub/events or extract a lower context if synchronous facade calls form a cycle.
 
-The goal is not to ignore errors; it's to avoid defensive noise where invariants already define
-valid input.
+### 15. Multi-Tenancy Is Detected From Scope
 
-### 11. Use `Repo.transact` when atomicity is needed
+Only scaffold `organization_id`, `tenant_id`, `visible_to/2`, and tenant fields if those fields
+exist on the project's `Scope` struct or are clearly modeled in the TLA+ spec. Do not invent
+tenancy the app does not have.
 
-Use `Repo.transact/1` when the operation has a real atomicity boundary: multiple dependent writes,
-a domain write plus job/audit/projection enqueue, locks and state transitions that must be
-consistent. A single independent insert/update doesn't need a transaction by convention alone.
+When tenant fields exist, every persistence query for that context filters through a scoped query
+fragment such as `visible_to/2`.
 
-Ownership is **per-need at each layer** — there is no global "outermost wraps everything" rule.
-Each command/workflow decides for itself whether its own operations need atomicity. Nested
-`Repo.transact` calls work via savepoints and are fine when each layer has its own atomic concern.
-
-```elixir
-def handle(%Scope{} = scope, attrs) do
-  Repo.transact(fn ->
-    with {:ok, command} <- validate(attrs),
-         {:ok, order}   <- build_order(scope, command),
-         :ok            <- ensure_has_line_items(order),
-         {:ok, placed}  <- Repo.insert(Order.place(order)) do
-      {:ok, placed}
-    end
-  end)
-end
-```
-
-### 12. Cross-context calls — eligibility and rules
-
-| Layer        | Can call other-context facades? |
-| ------------ | -------------------------------- |
-| Commands     | **Yes**                          |
-| Workflows    | **Yes**                          |
-| Workers      | Typically no — delegate to a workflow that does |
-| Queries      | **No** — composition lives at controller/LiveView or a dedicated read model |
-| Schemas      | **No** (hard restriction)        |
-| Policies     | **No** (hard restriction)        |
-
-Always call the other context's **public facade**, never its `Commands.*`, `Queries.*`,
-`Workflows.*`, or `Workers.*` modules. The same applies inside a single context: sibling commands
-call each other via `Sales.apply_discount/2`, not `Sales.Commands.ApplyDiscount`.
-
-Rules of the boundary:
-
-- **Scope flows verbatim.** Pass the same `%Scope{}` through. Authorization happened at the
-  boundary, but downstream contexts may still use scope for `visible_to/2`, audit attribution, or
-  derived data.
-- **Errors bubble verbatim.** `{:error, :unauthorized}` from a downstream context flows up
-  unchanged. Controllers pattern-match the same tagged atoms regardless of which context produced
-  them; don't introduce a remap layer.
-- **Returns may be the called schema.** `Billing.authorize_payment` returning `%Billing.Payment{}`
-  is fine — accept the cross-context coupling rather than hiding behind opaque IDs.
-- **Names stay in ubiquitous language.** `Sales.place_order` keeps that name even when it
-  internally calls Inventory and Billing.
-- **Workers are entry points, not bridges.** When a context needs an async cross-context trigger,
-  the called context exposes a facade function that enqueues its own worker
-  (`Billing.enqueue_payment_authorization(scope, ...)`). Never reach into another context's worker
-  module directly.
-- **Cycles are discouraged.** If a real cycle appears, treat it as a design signal — extract a
-  shared lower context, or replace the back-edge with a `Phoenix.PubSub` event.
-
-### 13. Workflows: internal multi-step orchestration
-
-Workflows are an **internal** layer (not on the facade) for multi-step domain processes that:
-
-- An **Oban worker** needs to drive (the common case — workers stay thin and delegate to a
-  workflow that owns the multi-step work);
-- A command needs to delegate to for non-trivial orchestration;
-
-Workflows are not for read-only aggregation. Repeated cross-context reads should live at the
-boundary, in an explicit read model/projection, or in a separate reporting context with its own
-public API.
-
-**Location:** `lib/my_app/sales/workflows/*.ex`, parallel to `commands/` and `queries/`.
-
-**Who calls a workflow:** commands and workers. Not the facade directly.
-
-**What a workflow can call:**
-- Own schemas + `Repo` (it can mutate state directly — workflows are not just orchestrators of
-  commands).
-- Own queries.
-- Other context facades (cross-context coordination).
-- (For now, not other workflows. That can come later if the pattern emerges.)
-
-**Trust model:** workflows assume the caller (command or worker) has already validated AND
-authorized. They take a **validated attrs map** (atom keys, required fields present) and use
-`Map.fetch!` to access keys. No `embedded_schema`, no `Policy.authorize`.
-
-**Atomicity:** a workflow owns its own outer `Repo.transact` when its orchestrated steps must be
-atomic. Inner commands may have their own transactions — savepoints handle the nesting.
-
-**When to extract a workflow (vs. inline in a command):** when the logic is not a public domain
-action but is internally needed — most commonly, when an Oban worker has to drive a multi-step
-process. If exactly one command would inline the same 3+ steps and no worker is involved, leaving
-it in the command is fine.
-
-### 14. Multi-tenancy is detected from Scope
-
-Only scaffold `organization_id` / `tenant_id` columns, the `visible_to(query, scope)` filter, and
-tenant fields on the schema **if those fields exist on the project's `Scope` struct**. If the Scope
-has no org/tenant, omit them entirely rather than inventing tenancy the app doesn't have. When they
-do exist, every persistence query for that context filters through `visible_to/2`.
-
-### 15. Queries return schemas by default, preloaded as needed
-
-A query handler returns the Ecto schema struct by default. Callers declare what they need preloaded
-per call (a `preload` option on the handler, or a query-level preload fragment composed in). Don't
-deep-preload everything by default — that pulls expensive data nobody asked for. Introduce a flat
-read model only when the read is clearly display-only (lists, dashboards, reports, exports) or
-performance-sensitive — and prefer doing so on explicit request rather than pre-emptively.
-
-Queries do **not** call other context facades. Cross-context read composition lives at the
-controller/LiveView level (call both `Sales.get_order` and `Billing.get_invoice` and assemble).
-If the composition repeats or becomes performance-sensitive, introduce a dedicated read
-model/projection or reporting context rather than hiding the dependency inside a query or workflow.
-
-### 16. Return shapes — virtual fields over anonymous maps
-
-Public APIs should return domain-shaped values:
-
-- Return persisted schemas, domain structs, or explicit result structs.
-- **Strongly prefer virtual fields on the schema** when a command result naturally extends the
-  domain object (a presigned URL on an upload, a signed token on a session).
-- Anonymous maps from public command APIs are a **violation** — flag during review.
-
-```elixir
-# Prefer:
-{:ok, %FileUpload{presigned_url: url, presigned_headers: headers}}
-
-# Over:
-{:ok, %{file_upload_id: id, presigned_url: url, presigned_headers: headers}}
-```
-
-JSON shaping for API responses belongs in JSON view modules or serializers, not in command return
-values and not directly in controllers.
-
-### 17. Workers stay thin
+### 16. Workers Stay Thin
 
 Workers are operational entry points. Each worker:
 
-- Carries scope in job args as a **serialized map** representation.
-- **Reconstitutes `%Scope{}`** via `Accounts.build_scope/1` (or your project's equivalent) at the
-  top of `perform/1`.
-- Optionally calls `Policy.authorize` — only when the work wasn't authorized at enqueue time and
-  this is the first untrusted entry point.
-- **Calls one workflow (preferred) or one command** through the facade. Multi-step domain work is
-  the workflow's job, not the worker's.
-- Keeps retry behavior, queue concerns, and operational metadata in the worker.
+- carries scope in job args as a serialized map representation;
+- reconstitutes `%Scope{}` with the project helper;
+- calls one public facade function or one same-context internal noun module;
+- keeps retry behavior, queue concerns, and operational metadata in the worker.
 
-If a worker starts accumulating domain branching, move that behavior into a workflow.
+If a worker starts accumulating domain branching, move that behavior into an internal noun module.
 
-### 18. Cross-context Ecto associations are forbidden
+Authorization still happens before enqueue or at the external boundary that schedules the work; it
+does not become worker-owned bounded-context behavior.
 
-Do **not** declare `belongs_to :user, Accounts.User` on a schema in a different context. Cross-
-context association is a hidden coupling that drags one context's schema module into another's
-loading path and undermines facade-only access.
+### 17. Cross-Context Ecto Associations Are Forbidden
 
-Instead:
+Do not declare `belongs_to :user, Accounts.User` on a schema in a different context. Use a bare FK
+field and load the referenced record through the owning context's facade when needed.
 
 ```elixir
-# In Reviews.Review:
-field :authored_by_id, :binary_id   # bare FK column, no belongs_to to Accounts.User
+field :authored_by_id, :binary_id
 ```
 
-Loading the referenced record goes through the other context's facade at the handler/workflow
-level (`Accounts.get_user(scope, %{id: review.authored_by_id})`). Within a single context,
-ordinary `belongs_to` between sibling schemas is fine.
+`belongs_to` between sibling schemas in the same context is fine.
 
-### 19. Migrations follow the owning context
+### 18. Errors: Fail Fast For Invariants, Tagged Tuples For Recoverable Cases
 
-- Put new tables in a migration that matches the **owning feature or context**.
-- Don't mix unrelated context changes in the same migration (no Reviews tables and
-  EvidenceIntake tables together).
-- **Greenfield contexts** still in active build-out: it's acceptable to fold related migrations
-  together when the user requests it.
-- **Mature contexts**: each schema change gets its own dated migration.
-- Use the project's generator convention (e.g. `mix ecto.gen.migration`) where it exists.
+Raise when the contract already guarantees the happy path: required attrs after validation,
+invariant lookups, programmer-bug states. Use bang functions such as `Map.fetch!`, `Repo.get!`, and
+internal facade bang functions.
 
-### 20. Other persistence conventions
+Return tagged tuples for recoverable domain decisions and external/user input:
+`:not_found`, `:invalid_transition`, `:insufficient_funds`, `:empty_order`, or
+`{:error, %Ecto.Changeset{}}`.
 
-- Money as integer cents + a `currency` string; don't mix representations.
-- Atom statuses → `Ecto.Enum`, not integers.
-- `has_many ..., on_replace: :delete` makes `cast_assoc` treat missing children as removed —
-  correct when the parent owns the full collection, dangerous for partial updates. Note when used.
-- Use row locks (`lock: "FOR UPDATE"`) when loading a parent for update under concurrency.
+Rules:
 
-## Naming: redundant prefixes
+- Do not wrap bang results in `{:ok, value}`.
+- Do not manually remap invariant lookup failures into new tagged tuples.
+- Public facade functions return tagged results; bang functions are internal unless the project
+  already exposes an explicit bang API.
+- Avoid broad `rescue _` / `catch` blocks unless a documented recovery path exists.
+
+### 19. Migrations Follow The Owning Context
+
+- Put new tables in a migration matching the owning feature/context.
+- Do not mix unrelated context changes in one migration.
+- Greenfield contexts still in active build-out may fold related migrations together when the user
+  requests it.
+- Mature contexts get one dated migration per schema change.
+- Match the project's generator convention.
+
+### 20. Persistence Conventions
+
+- Money uses integer cents plus a `currency` string.
+- Atom statuses use `Ecto.Enum`, not integers.
+- Use `has_many ..., on_replace: :delete` only when the parent owns the full collection.
+- Use row locks (`lock: "FOR UPDATE"`) when loading a parent for concurrent update.
+
+## Naming: Redundant Prefixes
 
 Inside a leaf schema or enum where the parent module already disambiguates, drop redundant
 prefixes:
@@ -513,85 +470,84 @@ prefixes:
 # Inside MyApp.Sales.FileUpload — prefer:
 defmodule Kind do
   use Ecto.Type
-  # ...
 end
-
-# Over MyApp.Sales.FileUpload.UploadKind — the "Upload" prefix is redundant.
 ```
 
-This applies to **schemas and enums only**. Commands, queries, workflows, and workers should keep
-the domain noun in their module name (`PlaceOrder`, `RunIntake`, `SendOrderConfirmation`) because
-those names appear in stack traces, telemetry, and logs where the parent namespace is lost.
+This applies to schemas and enums only. Public commands, public queries, workers, and internal
+noun orchestration modules keep precise domain nouns because their module names appear in logs,
+stack traces, and telemetry.
 
-## Controllers and JSON
+## Controllers And JSON
 
-Controllers should be thin:
+Controllers and LiveViews stay thin:
 
-- Validate / shape the request at the boundary.
-- Run authorization (Rule 9).
-- Call the bounded-context public API with `(scope, attrs)`.
-- Delegate response shaping to a JSON view module or serializer.
+- validate or shape request parameters at the boundary;
+- authorize using the web/boundary convention;
+- call the bounded-context public API with `(scope, attrs)`;
+- delegate response shaping to JSON view modules or serializers.
 
-**Detect and match** the codebase's existing JSON shaping pattern (Phoenix 1.7 JSON view modules,
-custom serializer modules, JSONAPI library). Don't impose one style.
+Do not call Repo directly from controllers for bounded-context records. Detect and match the
+codebase's existing JSON pattern.
 
 ## Testing
 
-Generate the pyramid (details and templates in `references/testing.md`):
+Generate the pyramid from `references/testing.md`:
 
-- **Handler tests (commands/queries)** — Repo-backed integration tests exercising input validation
-  failures, the happy path, state transitions, persistence, and cross-context happy/rollback paths
-  (with real downstream contexts, no mocks). **Do not test authorization here** — that moved to the
-  boundary (Rule 9).
-- **Workflow tests** — Repo-backed tests for the orchestrated steps, partial-failure rollback, and
-  any cross-context coordination. Workflows also get covered transitively through the
-  commands/workers that invoke them; per-workflow tests focus on the orchestration concerns.
-- **Controller / LiveView tests** — HTTP behavior, response shape, **and the authorization path**
-  (which scopes are allowed/denied, what plugs reject, what status codes come back).
+- **Public handler tests**: Repo-backed tests for commands/queries covering input validation,
+  state transitions, persistence, Flop-backed collection reads where applicable, and
+  cross-context happy/rollback paths with real downstream contexts. Do not test authorization here.
+- **Internal orchestration tests**: Repo-backed tests for noun modules covering orchestration,
+  partial-failure rollback, worker-driven behavior, and cross-context coordination.
+- **Boundary tests**: controller/LiveView/plug tests for HTTP behavior, response shape, and
+  authorization.
 
-StreamData is only needed if you choose to do property-style handler tests; flag it if absent and
-you're adding such tests.
+StreamData is optional for rich property-style operation-sequence testing at the public handler
+tier.
 
-## Review mode: what to auto-fix vs flag
+## Review Mode: Auto-Fix Vs Flag
 
-**Auto-fix (hard violations):**
+**Auto-fix hard violations:**
 
-- `Repo.*` calls inside a schema module → move the call to the handler/workflow that owns
-  persistence; have the schema return a changeset or query instead.
-- Cross-context `belongs_to` (`belongs_to :user, Accounts.User` in a foreign context's schema) →
-  rewrite as a bare FK column (`field :user_id, :binary_id`) and update loading sites to go through
-  the owning context's facade.
+- `Repo.*` calls inside schema modules: move persistence to the public handler or internal noun
+  module.
+- Cross-context `belongs_to`: replace with a bare FK and update loading sites to use the owning
+  context's facade.
+- Public collection reads bypassing Flop when Flop is available/required: route through
+  `Repo.list/3` or `Repo.paginate/3` and add `@derive Flop.Schema`.
+- New `Workflows.*` modules or `workflows/` folders: rename/move to direct child noun modules,
+  preserving behavior.
 
-**Flag, don't silently rewrite (judgment calls):**
+**Flag for user judgment:**
 
-- Anonymous map returns from public command APIs → suggest a schema + virtual field or an explicit
-  result struct; let the user pick.
-- Broad `rescue _` / `catch` around domain calls → request a documented recovery path; don't strip
-  the block on assumption.
-- `Policy.authorize` called inside a handler → suggest moving authz to the boundary, but explain
-  the trade-off (some teams still want defense-in-depth).
-- Status field without Gearbox → suggest adding the state machine; show the transitions you'd
-  declare.
+- A command/query exposed publicly without a clear TLA+/architecture/boundary need.
+- Anonymous map returns from public command APIs.
+- Broad rescue/catch around domain calls.
+- Status fields without Gearbox.
+- Authorization inside bounded-context modules. Recommend moving it to the boundary; do not
+  silently rewrite web/auth structure unless the project pattern is clear.
 
-## Dependency direction
+## Dependency Direction
 
 ```
-Controller / LiveView -> Policy.authorize (at boundary, opt-in)
-  -> MyApp.Sales (facade)
-      -> Commands.*  (user/system intent)
-      -> Queries.*   (reads)
+Controller / LiveView / Plug / Resolver
+  -> boundary authorization
+  -> MyApp.Sales facade
+      -> Commands.*  (necessary public write APIs)
+      -> Queries.*   (necessary public read APIs)
 
-Worker -> rebuild Scope -> Policy (only if needed) -> Workflows.* (preferred) or Commands.*
+Worker
+  -> rebuild Scope
+  -> one facade function OR one same-context internal noun module
 
-Commands.* / Workflows.*
+Commands.* / internal noun modules
   -> Schema -> Repo
-  -> Other context facade   (cross-context allowed)
+  -> Other context facade when needed
 
 Queries.*
-  -> Schema -> Repo only    (no cross-context calls)
+  -> Schema query fragments -> Repo
+  -> Repo.list / Repo.paginate for collection reads
 ```
 
-The schema holds the domain (Gearbox + changesets + transition functions + `build!/1`) but never
-calls `Repo`. Handlers and workflows are the layers that call `Repo`. The facade orchestrates
-nothing. Cross-context calls always enter through another context's facade, and only commands and
-workflows make them. Authorization sits at the entry boundary, not inside the domain.
+The schema holds the domain and never calls `Repo`. The facade orchestrates nothing. Cross-context
+calls always enter through another context's facade. Authorization sits above the bounded context,
+not inside it.

@@ -1,36 +1,33 @@
-# Testing the Test Pyramid
+# Testing The Test Pyramid
 
 Generate tests at three levels:
 
 ```
-Handler tests        Repo + input validation + state transitions + persistence.
-(commands/queries)   For cross-context commands: real downstream contexts (no mocks) + rollback
-                     when the command owns an atomicity boundary.
-                     Do NOT cover authorization here — that lives at the boundary.
+Public handler tests       Repo + input validation + state transitions + persistence.
+(commands/queries)         Collection queries exercise Repo.list/Repo.paginate + Flop validation.
+                           Cross-context commands use real downstream contexts when possible.
+                           Do NOT cover authorization here.
 
-Workflow tests       Repo + orchestration + partial-failure rollback + cross-context coordination.
-                     Workflows are also exercised transitively through the commands/workers that
-                     invoke them; per-workflow tests focus on orchestration concerns.
+Internal orchestration     Repo + multi-step orchestration + partial-failure rollback +
+module tests               worker-driven behavior + cross-context coordination.
+                           These are tests for noun modules such as Sales.OrderVerification.
 
-Boundary tests       HTTP / LiveView behavior, response shape, AND the authorization path
-(controller/LV)      (which scopes are allowed/denied, what status codes come back, what plugs
-                     reject).
+Boundary tests             HTTP / LiveView / plug behavior, response shape, and authorization.
+(controller/LV/plug)       This is where allowed/denied scopes and status codes are verified.
 ```
 
-Why the split? Authorization moved to the boundary (controllers/LiveViews/plugs), so handler tests
-no longer assert "unauthorized scope rejects." That test still exists — it just lives where the
-authz decision lives. This keeps handler tests focused on domain behavior and prevents the
-duplicate-authz-check trap.
+Authorization is outside the bounded context, so public handler tests no longer assert
+"unauthorized scope rejects." That test still exists; it lives where authorization lives. This
+keeps domain tests focused on domain behavior and avoids duplicate authorization checks.
 
-There's no fast pure-aggregate tier because there's no separate aggregate: the schema is the
-domain model, and exercising its transitions meaningfully requires the Repo. If your domain is
-genuinely rich enough to warrant property-style operation-sequence testing, do it at the handler
-tier — see the optional aside at the bottom.
+There is no fast pure-aggregate tier because there is no separate aggregate: the Ecto schema is the
+domain model, and exercising its transitions meaningfully usually requires Repo-backed tests. If
+the domain warrants property-style operation-sequence testing, do it at the public handler tier.
 
-## Command/query handler test
+## Public Command Handler Test
 
-Repo-backed. Exercise input validation failures, the happy path, the state transition, and
-persistence. Assert on the returned schema struct directly. **No authorization tests here.**
+Repo-backed. Exercise input validation failures, the happy path, state transitions, persistence,
+and returned schema structs. No authorization tests here.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrderTest do
@@ -75,14 +72,54 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 end
 ```
 
-## Cross-context tests live in the command's (or workflow's) test file
+## Public Collection Query Test
 
-When a command or workflow calls into other contexts (e.g. `Sales.place_order` calls
-`Inventory.reserve_stock` and `Billing.authorize_payment`), the cross-context paths are tested in
-the same file as the single-context paths — no separate test tier, no mocks. Drive the downstream
-contexts into the state you need (insufficient stock, payment that will fail) using their real
-public API, then assert both the bubbled error and that the earlier Sales write rolled back
-through the composing `Repo.transact`.
+Collection reads must exercise Flop validation, filtering, ordering, and pagination through the
+Repo helpers.
+
+```elixir
+defmodule MyApp.Sales.Queries.ListOrdersTest do
+  use MyApp.DataCase, async: true
+
+  alias MyApp.Sales
+
+  describe "list_orders/2" do
+    test "filters and orders orders through Flop" do
+      scope = build_scope()
+      cancelled = insert_order(scope, status: :cancelled, inserted_at: ~U[2026-01-01 00:00:00Z])
+      placed = insert_order(scope, status: :placed, inserted_at: ~U[2026-01-02 00:00:00Z])
+      insert_order(build_scope(), status: :placed)
+
+      params = %{
+        "filters" => [%{"field" => "status", "op" => "==", "value" => "placed"}],
+        "order_by" => ["inserted_at"],
+        "order_directions" => ["desc"]
+      }
+
+      assert {:ok, {orders, _meta}} = Sales.list_orders(scope, params)
+      assert Enum.map(orders, & &1.id) == [placed.id]
+      refute Enum.any?(orders, &(&1.id == cancelled.id))
+    end
+
+    test "returns a Flop validation error for unsupported filters" do
+      scope = build_scope()
+      params = %{"filters" => [%{"field" => "internal_notes", "op" => "like", "value" => "x"}]}
+
+      assert {:error, %Flop.Meta{}} = Sales.list_orders(scope, params)
+    end
+  end
+end
+```
+
+If the public API uses `Repo.list/3` instead of `Repo.paginate/3`, assert `{:ok, results}` rather
+than `{results, meta}`.
+
+## Cross-Context Tests
+
+When a public command or internal noun module calls other contexts, test those paths in the same
+file as the behavior being composed. Use real downstream contexts where possible. Drive downstream
+contexts into the needed state through their public APIs, then assert both the bubbled error and
+rollback behavior.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrderTest do
@@ -98,7 +135,6 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
       attrs = order_attrs(payment: invalid_card_attrs())
 
       assert {:error, :payment_declined} = Sales.place_order(scope, attrs)
-      # the order write must not survive the composing transaction's rollback
       assert Repo.aggregate(Order, :count) == 0
     end
 
@@ -114,63 +150,64 @@ defmodule MyApp.Sales.Commands.PlaceOrderTest do
 end
 ```
 
-> Reach for mocks only when a downstream call hits a real external system (e.g. a payment gateway
-> HTTP API). The cross-context call itself stays real — what gets stubbed is the system at the
-> very edge of the application.
+Reach for mocks only when a downstream call hits a real external system. The cross-context call
+itself stays real; the external edge is what gets stubbed.
 
-## Workflow test
+## Internal Orchestration Module Test
 
-Repo-backed. The workflow trusts the caller has validated and authorized, so workflow tests
-**start from a validated attrs map** and focus on:
+Repo-backed. Internal noun modules trust their caller contract, so tests start from validated attrs
+or fixtures and focus on:
 
-- The orchestration sequence happens correctly.
-- Persistence side-effects land.
-- Partial failure rolls back (when the workflow owns a transaction).
-- Cross-context error tuples bubble verbatim.
+- the orchestration sequence;
+- persistence side effects;
+- rollback on partial failure when the module owns a transaction;
+- cross-context error tuples bubbling verbatim;
+- worker-driven behavior when an Oban worker delegates to the module.
 
 ```elixir
-defmodule MyApp.Sales.Workflows.RunFulfillmentTest do
+defmodule MyApp.Sales.OrderVerificationTest do
   use MyApp.DataCase, async: true
 
   alias MyApp.Repo
-  alias MyApp.Sales.Order
-  alias MyApp.Sales.Workflows.RunFulfillment
+  alias MyApp.Sales.OrderVerification
 
-  defp scope, do: build_scope()
-
-  describe "run/2" do
+  describe "verify_for_fulfillment/2" do
     test "fulfills the order when Inventory and Billing both succeed" do
-      order = insert_order(status: :placed)
+      scope = build_scope()
+      order = insert_order(scope, status: :placed)
       attrs = %{order_id: order.id, payment: valid_payment()}
 
-      assert {:ok, fulfilled} = RunFulfillment.run(scope(), attrs)
+      assert {:ok, fulfilled} = OrderVerification.verify_for_fulfillment(scope, attrs)
       assert fulfilled.status == :fulfilled
     end
 
-    test "rolls back the fulfillment when Billing declines" do
-      order = insert_order(status: :placed)
+    test "rolls back fulfillment when Billing declines" do
+      scope = build_scope()
+      order = insert_order(scope, status: :placed)
       attrs = %{order_id: order.id, payment: invalid_payment()}
 
-      assert {:error, :payment_declined} = RunFulfillment.run(scope(), attrs)
+      assert {:error, :payment_declined} = OrderVerification.verify_for_fulfillment(scope, attrs)
       assert Repo.reload!(order).status == :placed
     end
 
-    test "raises when a required attrs key is missing (invariant violation)" do
+    test "raises when a required attrs key is missing" do
+      scope = build_scope()
+
       assert_raise KeyError, fn ->
-        RunFulfillment.run(scope(), %{order_id: Ecto.UUID.generate()})  # missing :payment
+        OrderVerification.verify_for_fulfillment(scope, %{order_id: Ecto.UUID.generate()})
       end
     end
   end
 end
 ```
 
-> A workflow's "missing required key" test is optional — it just documents that the workflow's
-> input contract is enforced via `Map.fetch!`. Skip it if it's noise.
+The missing-key test is optional. Use it when documenting the trusted internal contract helps more
+than it clutters.
 
-## Boundary test (controller / LiveView)
+## Boundary Test
 
-Verify status codes and response shape for success, validation error, not-found, **and
-unauthorized**. This is where authz coverage now lives.
+Verify status codes and response shape for success, validation error, not-found, and unauthorized
+cases. This is where authorization coverage lives.
 
 ```elixir
 defmodule MyAppWeb.OrderControllerTest do
@@ -182,7 +219,7 @@ defmodule MyAppWeb.OrderControllerTest do
       assert %{"status" => "placed"} = json_response(conn, 201)
     end
 
-    test "returns 403 when the scope lacks :place_order permission", %{conn: conn} do
+    test "returns 403 when the boundary authorization rejects the scope", %{conn: conn} do
       conn = post(authed(conn, perms: []), ~p"/orders", order: valid_order_params())
       assert response(conn, 403)
     end
@@ -199,7 +236,7 @@ defmodule MyAppWeb.OrderControllerTest do
       assert response(conn, 404)
     end
 
-    test "returns 403 when the scope lacks :read_order permission", %{conn: conn} do
+    test "returns 403 when boundary authorization rejects the scope", %{conn: conn} do
       conn = get(authed(conn, perms: []), ~p"/orders/#{Ecto.UUID.generate()}")
       assert response(conn, 403)
     end
@@ -207,17 +244,14 @@ defmodule MyAppWeb.OrderControllerTest do
 end
 ```
 
-> If authorization is enforced by a plug (not the controller action), put the 403 tests against
-> the pipeline rather than each action.
+If authorization is enforced by a plug or pipeline, put the 403 tests against that boundary rather
+than duplicating checks in every action.
 
-## Optional: property-style handler tests
+## Optional: Property-Style Public Handler Tests
 
-When a domain is rich enough that you genuinely want "any sequence of valid operations preserves
-the invariants" coverage, write that test at the handler tier — drive sequences through the public
-context functions (`Sales.place_order`, `Sales.add_line_item`, `Sales.cancel_order`) and assert on
-the persisted result. This is slower than pure in-memory property tests and isn't free, so reach
-for it only when the domain interaction graph is genuinely complex (multi-step lifecycles, many
-optional commands, intricate cross-field rules).
+When a domain is rich enough that "any sequence of valid operations preserves the invariants"
+coverage is valuable, write that at the public handler tier. Drive sequences through public context
+functions and assert on persisted results.
 
-`{:stream_data, "~> 1.0", only: [:test]}` (or similar) needs to be in `mix.exs` if you go this
-route — flag it if absent.
+`{:stream_data, "~> 1.0", only: [:test]}` or similar needs to be in `mix.exs` if you add these
+tests. Flag it if absent.

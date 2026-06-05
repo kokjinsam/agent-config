@@ -1,26 +1,62 @@
 # Code Templates
 
-Full code templates for each layer. Substitute `MyApp` / `Sales` / `Order` with the detected app
-namespace and the context/entity names. Mirror the surrounding codebase's conventions (id type,
-`timestamps` type, formatting) where they differ.
+Substitute `MyApp`, `Sales`, and `Order` with the detected app namespace and domain names. Mirror
+the surrounding codebase's id type, timestamp type, formatter, migrations, and helper functions
+where they differ.
 
 ## Contents
 
+- Repo Flop helpers
 - Public facade
-- Policy (optional)
-- Command handler
-- Query handler
-- Workflow
-- Ecto schema (parent, with Gearbox + transitions + `build!/1` + queries)
+- Public command handler
+- Public query handler
+- Public collection query with Flop
+- Internal noun orchestration module
+- Ecto schema with Gearbox, Flop derive, transitions, `build!/1`, and query fragments
 - Child Ecto schema
-- Cross-context reference (bare FK, no `belongs_to`)
-- Cross-context call inside a command/workflow
-- Worker (rebuilds scope, calls a workflow)
+- Cross-context reference
+- Cross-context call inside a command or internal noun module
+- Worker
 - Async cross-context entry point through a facade
-- Controller (authorization at boundary)
+- Controller with boundary authorization
 - Migration
 
-## Public facade
+## Repo Flop Helpers
+
+Add these to the project Repo if absent. All public collection reads, filtering, ordering, and
+pagination go through these helpers.
+
+```elixir
+defmodule MyApp.Repo do
+  use Ecto.Repo,
+    otp_app: :my_app,
+    adapter: Ecto.Adapters.Postgres
+
+  def paginate(queryable, params, opts \\ []) do
+    Flop.validate_and_run(queryable, params, opts)
+  end
+
+  def list(queryable, params, opts \\ []) do
+    with {:ok, flop} <- Flop.validate(params, opts) do
+      results =
+        queryable
+        |> Flop.filter(flop, opts)
+        |> Flop.order_by(flop, opts)
+        |> all()
+
+      {:ok, results}
+    end
+  end
+end
+```
+
+Use `paginate/3` when callers need metadata and `list/3` when callers need only the filtered and
+ordered result list.
+
+## Public Facade
+
+Only expose operations that are necessary and important public boundary APIs. Do not scaffold
+default CRUD-style functions just because an entity exists.
 
 ```elixir
 defmodule MyApp.Sales do
@@ -32,48 +68,21 @@ defmodule MyApp.Sales do
   defdelegate place_order(scope, attrs), to: PlaceOrder, as: :handle
   defdelegate cancel_order(scope, attrs), to: CancelOrder, as: :handle
   defdelegate get_order(scope, attrs), to: GetOrder, as: :handle
-  defdelegate list_orders(scope, attrs \\ %{}), to: ListOrders, as: :handle
+  defdelegate list_orders(scope, params \\ %{}), to: ListOrders, as: :handle
 end
 ```
 
-> Workflows are **not** exposed on the facade. They're internal — only commands and workers call
-> them.
+No authorization and no orchestration live in the facade. Internal noun modules such as
+`Sales.Orders` are not exposed unless their operation becomes a real public API and is wrapped in a
+public command/query handler.
 
-## Policy (optional)
+## Public Command Handler
 
-Only scaffold a Policy module when the context has non-trivial action-specific authorization.
-For simple contexts, a controller-level plug or check is enough.
+The handler owns input validation, wraps work in `Repo.transact` when the operation needs an
+atomicity boundary, checks business preconditions in the `with` chain, calls schema transition
+functions, and persists through `Repo`.
 
-The Policy is called **from controllers/LiveViews** (or from workers when they're the first
-untrusted entry point), **not from inside handlers**.
-
-```elixir
-defmodule MyApp.Sales.Policy do
-  alias MyApp.Accounts.Scope
-
-  @spec authorize(Scope.t(), atom(), map()) :: :ok | {:error, :unauthorized}
-  def authorize(scope, action, params \\ %{})
-
-  def authorize(%Scope{} = scope, :place_order, _params) do
-    if :place_order in scope.permissions, do: :ok, else: {:error, :unauthorized}
-  end
-
-  def authorize(%Scope{} = scope, :cancel_order, _params) do
-    if :cancel_order in scope.permissions, do: :ok, else: {:error, :unauthorized}
-  end
-
-  def authorize(%Scope{}, _action, _params), do: {:error, :unauthorized}
-end
-```
-
-## Command handler
-
-The handler owns input validation, wraps the work in `Repo.transact` when the operation needs an
-atomicity boundary, checks business preconditions in the `with` chain, calls the schema's
-transition function (which returns a changeset), and persists through `Repo`. Returns the
-persisted schema struct.
-
-It does **not** call `Policy.authorize` — the caller (controller / LiveView / worker) already did.
+It does not call authorization code.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrder do
@@ -99,8 +108,8 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
   def handle(%Scope{} = scope, attrs) when is_map(attrs) do
     Repo.transact(fn ->
       with {:ok, command} <- validate(attrs),
-           {:ok, order}   <- build_order(scope, command),
-           {:ok, placed}  <- Repo.insert(Order.place(order)) do
+           {:ok, order} <- build_order(scope, command),
+           {:ok, placed} <- Repo.insert(Order.place(order)) do
         {:ok, placed}
       end
     end)
@@ -128,16 +137,15 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     |> validate_number(:unit_price_cents, greater_than_or_equal_to: 0)
   end
 
-  # Build an in-memory %Order{} (with line items) ready for the state transition.
   defp build_order(%Scope{} = scope, %__MODULE__{} = command) do
     line_items =
-      Enum.map(command.line_items, fn li ->
+      Enum.map(command.line_items, fn line_item ->
         %{
-          product_id: li.product_id,
-          sku: li.sku,
-          quantity: li.quantity,
-          unit_price_cents: li.unit_price_cents,
-          subtotal_cents: li.quantity * li.unit_price_cents
+          product_id: line_item.product_id,
+          sku: line_item.sku,
+          quantity: line_item.quantity,
+          unit_price_cents: line_item.unit_price_cents,
+          subtotal_cents: line_item.quantity * line_item.unit_price_cents
         }
       end)
 
@@ -160,19 +168,14 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
     scope
     |> Map.from_struct()
     |> Map.take([:organization_id, :tenant_id])
-    |> maybe_put_organization_id(scope)
   end
-
-  defp maybe_put_organization_id(attrs, %{organization: %{id: organization_id}}),
-    do: Map.put(attrs, :organization_id, organization_id)
-
-  defp maybe_put_organization_id(attrs, _scope), do: attrs
 end
 ```
 
-## Query handler
+## Public Query Handler
 
-Returns the schema directly. Preloads are explicit. No `Policy` call — the caller authorized.
+Single-record identity lookups do not need Flop. They still validate input and use scoped query
+fragments.
 
 ```elixir
 defmodule MyApp.Sales.Queries.GetOrder do
@@ -211,15 +214,36 @@ defmodule MyApp.Sales.Queries.GetOrder do
 end
 ```
 
-## Workflow
+## Public Collection Query With Flop
 
-Internal multi-step orchestration. **Not** exposed on the facade. Called by a command or a worker.
-Trusts the caller to have validated AND authorized. Takes a **validated attrs map** with atom keys
-and accesses required keys via `Map.fetch!`. Can call own schemas + `Repo`, own queries, and other
-context facades. Owns its own outer `Repo.transact` when its orchestration needs atomicity.
+Use this pattern only when the list is a necessary public read. All list/search/filter/sort paths
+go through `Repo.list/3` or `Repo.paginate/3`.
 
 ```elixir
-defmodule MyApp.Sales.Workflows.RunFulfillment do
+defmodule MyApp.Sales.Queries.ListOrders do
+  alias MyApp.Accounts.Scope
+  alias MyApp.Repo
+  alias MyApp.Sales.Order
+
+  def handle(%Scope{} = scope, params) when is_map(params) do
+    Order
+    |> Order.visible_to(scope)
+    |> Order.preload_line_items()
+    |> Repo.paginate(params, for: Order)
+  end
+end
+```
+
+Use `Repo.list(query, params, for: Order)` when the public API should return `{:ok, results}`
+without pagination metadata.
+
+## Internal Noun Orchestration Module
+
+No `Workflows.*` convention. Internal orchestration modules live directly under the context
+namespace and are named from ubiquitous language.
+
+```elixir
+defmodule MyApp.Sales.OrderVerification do
   alias MyApp.Accounts.Scope
   alias MyApp.Billing
   alias MyApp.Inventory
@@ -227,32 +251,30 @@ defmodule MyApp.Sales.Workflows.RunFulfillment do
   alias MyApp.Sales.Order
   alias MyApp.Sales.Queries.GetOrder
 
-  # Trusted, validated attrs map: %{order_id: binary_id, payment: map}
-  def run(%Scope{} = scope, attrs) when is_map(attrs) do
+  def verify_for_fulfillment(%Scope{} = scope, attrs) when is_map(attrs) do
     order_id = Map.fetch!(attrs, :order_id)
-    payment  = Map.fetch!(attrs, :payment)
+    payment = Map.fetch!(attrs, :payment)
 
     Repo.transact(fn ->
       with {:ok, order} <- GetOrder.handle(scope, %{id: order_id}),
-           {:ok, _resv} <- Inventory.reserve_stock(scope, %{order_id: order.id}),
-           {:ok, _pay}  <- Billing.authorize_payment(scope, %{order_id: order.id, payment: payment}),
-           {:ok, ship}  <- Repo.update(Order.mark_fulfilled(order)) do
-        {:ok, ship}
+           {:ok, _reservation} <- Inventory.reserve_stock(scope, %{order_id: order.id}),
+           {:ok, _payment} <- Billing.authorize_payment(scope, %{order_id: order.id, payment: payment}),
+           {:ok, fulfilled} <- Repo.update(Order.mark_fulfilled(order)) do
+        {:ok, fulfilled}
       end
     end)
   end
 end
 ```
 
-> When a command delegates to a workflow, it just calls `RunFulfillment.run(scope, validated_attrs)`
-> after its own input validation. The workflow does not re-validate.
+Use a plural schema noun such as `Orders` when it precisely names the behavior. Use a more specific
+noun such as `OrderVerification` when the plural noun is too broad. Do not use `Processor`,
+`Manager`, `Runner`, `Workflow`, `Orchestrator`, or `Service`.
 
-## Ecto schema (parent)
+## Ecto Schema
 
-One schema per entity. It owns the table, the Gearbox state machine, changesets, transition
-functions (which return changesets), `build!/1` for in-memory variants, and query fragments. It
-does **not** call `Repo`. The template below shows a binary-id project; drop `@primary_key` /
-`@foreign_key_type` and the binary-id migration fields when the existing project uses integer ids.
+One schema per entity. It owns the table, Gearbox state machine, changesets, transition functions,
+`build!/1`, Flop derive for public collection reads, and query fragments. It does not call `Repo`.
 
 ```elixir
 defmodule MyApp.Sales.Order do
@@ -262,6 +284,13 @@ defmodule MyApp.Sales.Order do
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
+
+  @derive {
+    Flop.Schema,
+    filterable: [:status, :customer_id],
+    sortable: [:inserted_at, :status],
+    default_order: %{order_by: [:inserted_at], order_directions: [:desc]}
+  }
 
   use Gearbox,
     field: :status,
@@ -277,22 +306,18 @@ defmodule MyApp.Sales.Order do
 
   schema "orders" do
     field :customer_id, :binary_id
-    field :organization_id, :binary_id   # only if Scope has organization
-    field :tenant_id, :binary_id         # only if Scope has tenant
+    field :organization_id, :binary_id
+    field :tenant_id, :binary_id
     field :status, Ecto.Enum, values: [:draft, :placed, :cancelled, :fulfilled], default: :draft
     field :placed_at, :utc_datetime
     field :total_cents, :integer, default: 0
     field :currency, :string, default: "USD"
-
-    # Virtual fields used for command return shapes (Rule 16):
     field :payment_intent_url, :string, virtual: true
 
     has_many :line_items, OrderLineItem, foreign_key: :order_id, on_replace: :delete
 
     timestamps()
   end
-
-  # --- changesets ---------------------------------------------------------
 
   def changeset(order, attrs) do
     order
@@ -302,12 +327,6 @@ defmodule MyApp.Sales.Order do
     |> cast_assoc(:line_items, with: &OrderLineItem.changeset/2)
   end
 
-  # --- build!/1 for in-memory (non-persisted) variants -------------------
-  #
-  # Use when you need a struct-shaped value for internal passing (event payloads,
-  # value objects). `Map.fetch!` raises on missing required keys — the caller's
-  # contract guarantees them. Do not use this to skip the changeset for persistence.
-
   def build!(attrs) do
     %__MODULE__{
       customer_id: Map.fetch!(attrs, :customer_id),
@@ -315,8 +334,6 @@ defmodule MyApp.Sales.Order do
       total_cents: Map.fetch!(attrs, :total_cents)
     }
   end
-
-  # --- transition functions (return changesets) --------------------------
 
   def place(order) do
     order
@@ -336,8 +353,6 @@ defmodule MyApp.Sales.Order do
     |> Gearbox.transition(:fulfilled)
   end
 
-  # Child mutations route through the parent so the parent's invariants stay
-  # in one place even though Ecto stores children in their own table.
   def add_line_item(order, attrs) do
     quantity = Map.fetch!(attrs, :quantity)
     unit_price_cents = Map.fetch!(attrs, :unit_price_cents)
@@ -357,18 +372,15 @@ defmodule MyApp.Sales.Order do
     })
   end
 
-  # --- query fragments (return Ecto.Query, never execute) ----------------
-
   def by_id(query \\ __MODULE__, id), do: from(o in query, where: o.id == ^id)
 
   def for_customer(query \\ __MODULE__, customer_id),
     do: from(o in query, where: o.customer_id == ^customer_id)
 
-  # only when Scope carries org/tenant:
   def visible_to(query \\ __MODULE__, %Scope{} = scope) do
     scope_attrs = Map.from_struct(scope)
-    organization_id = Map.get(scope_attrs, :organization_id) || get_in(scope_attrs, [:organization, :id])
-    tenant_id = Map.fetch!(scope_attrs, :tenant_id)
+    organization_id = Map.get(scope_attrs, :organization_id)
+    tenant_id = Map.get(scope_attrs, :tenant_id)
 
     from o in query,
       where: o.organization_id == ^organization_id,
@@ -383,13 +395,12 @@ defmodule MyApp.Sales.Order do
 end
 ```
 
-> Transition functions return changesets, not `{:ok, _}` / `{:error, _}`. The handler runs them
-> through `Repo.insert` / `Repo.update`, which surfaces Gearbox transition errors as changeset
-> errors — keeping the error shape consistent.
+Only include tenant fields and `visible_to/2` clauses that match the actual `Scope` struct. Only
+include `@derive Flop.Schema` when this schema participates in public collection reads.
 
-## Child Ecto schema
+## Child Ecto Schema
 
-Lives alongside the parent under `sales/`, not under a separate `repo/` subtree.
+Sibling associations in the same context are fine.
 
 ```elixir
 defmodule MyApp.Sales.OrderLineItem do
@@ -408,7 +419,7 @@ defmodule MyApp.Sales.OrderLineItem do
     field :unit_price_cents, :integer
     field :subtotal_cents, :integer
 
-    belongs_to :order, Order   # OK — same context
+    belongs_to :order, Order
 
     timestamps()
   end
@@ -424,10 +435,9 @@ defmodule MyApp.Sales.OrderLineItem do
 end
 ```
 
-## Cross-context reference (bare FK, no `belongs_to`)
+## Cross-Context Reference
 
-Cross-context references use **bare FK columns**, not `belongs_to`. The owning context loads the
-record through the foreign context's facade.
+Cross-context references use bare FK columns, not `belongs_to`.
 
 ```elixir
 defmodule MyApp.Reviews.Review do
@@ -436,7 +446,6 @@ defmodule MyApp.Reviews.Review do
 
   schema "reviews" do
     field :title, :string
-    # Bare FK — DO NOT `belongs_to :author, MyApp.Accounts.User` across contexts.
     field :authored_by_id, :binary_id
 
     timestamps()
@@ -450,22 +459,16 @@ defmodule MyApp.Reviews.Review do
 end
 ```
 
-Loading the author goes through the facade:
+Load the referenced record through the owning context's facade when needed:
 
 ```elixir
-# Inside a Reviews command/workflow that needs the author:
-{:ok, review} <- Repo.insert(...),
 {:ok, author} <- Accounts.get_user(scope, %{id: review.authored_by_id})
 ```
 
-`belongs_to` between schemas in the **same** context (like `OrderLineItem` → `Order` above) stays
-fine.
+## Cross-Context Call Inside A Command Or Internal Noun Module
 
-## Cross-context call inside a command/workflow
-
-Cross-context orchestration lives inside a command or a workflow. Call the other context's public
-facade with the same `%Scope{}` and attrs maps, let errors bubble verbatim, and wrap the
-composition in `Repo.transact` when the work needs all-or-nothing behavior.
+Call the other context's public facade with the same `%Scope{}` and attrs maps. Let errors bubble
+unless the public contract says otherwise.
 
 ```elixir
 defmodule MyApp.Sales.Commands.PlaceOrder do
@@ -478,15 +481,13 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
   alias MyApp.Repo
   alias MyApp.Sales.Order
 
-  # ... embedded_schema and validation as in the basic Command handler template ...
-
   def handle(%Scope{} = scope, attrs) when is_map(attrs) do
     Repo.transact(fn ->
       with {:ok, command} <- validate(attrs),
-           {:ok, order}   <- build_order(scope, command),
-           {:ok, placed}  <- Repo.insert(Order.place(order)),
-           {:ok, _resv}   <- Inventory.reserve_stock(scope, %{order_id: placed.id}),
-           {:ok, _pay}    <- Billing.authorize_payment(scope, %{order_id: placed.id, payment: command.payment}) do
+           {:ok, order} <- build_order(scope, command),
+           {:ok, placed} <- Repo.insert(Order.place(order)),
+           {:ok, _reservation} <- Inventory.reserve_stock(scope, %{order_id: placed.id}),
+           {:ok, _payment} <- Billing.authorize_payment(scope, %{order_id: placed.id, payment: command.payment}) do
         {:ok, placed}
       end
     end)
@@ -494,31 +495,25 @@ defmodule MyApp.Sales.Commands.PlaceOrder do
 end
 ```
 
-> The same pattern applies inside a single context — sibling commands call each other through
-> their own facade (`Sales.apply_discount/2`), never through `Sales.Commands.ApplyDiscount` directly.
-> When this kind of orchestration spans 3+ cross-context calls or is also driven by a worker,
-> extract it to a workflow (see the Workflow section above) so the worker can call the workflow directly.
+If the behavior is also driven by a worker or reused by multiple public operations, move the
+sequence into a same-context internal noun module such as `Sales.OrderVerification`.
 
-## Worker (rebuilds scope, calls a workflow)
+## Worker
 
-Workers stay thin. Each worker:
-
-1. Carries scope in job args as a serialized map.
-2. Calls `Accounts.build_scope/1` (your project's equivalent) to reconstitute `%Scope{}`.
-3. Calls **one workflow** (preferred) or one command. No business logic.
+Workers rebuild scope and call one public facade function or one same-context internal noun module.
 
 ```elixir
 defmodule MyApp.Sales.Workers.FulfillOrderWorker do
   use Oban.Worker, queue: :sales
 
   alias MyApp.Accounts
-  alias MyApp.Sales.Workflows.RunFulfillment
+  alias MyApp.Sales.OrderVerification
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"scope" => scope_attrs} = args}) do
     {:ok, scope} = Accounts.build_scope(scope_attrs)
 
-    RunFulfillment.run(scope, %{
+    OrderVerification.verify_for_fulfillment(scope, %{
       order_id: Map.fetch!(args, "order_id"),
       payment: Map.fetch!(args, "payment")
     })
@@ -526,15 +521,13 @@ defmodule MyApp.Sales.Workers.FulfillOrderWorker do
 end
 ```
 
-> The worker doesn't call `Policy.authorize` — authorization happened at the enqueue site (the
-> controller or command that scheduled this job). Add a Policy call here only when the worker is
-> the first untrusted entry point.
+Authorization happens before enqueue or at the external boundary that schedules the work. The
+worker does not own authorization rules.
 
-## Async cross-context entry point through a facade
+## Async Cross-Context Entry Point Through A Facade
 
-When another context needs to trigger work in this one asynchronously, expose an enqueue function
-on this context's facade — never let outsiders reach into `Workers.*` directly. Keep the facade
-thin by delegating to a command handler that validates attrs and builds the job.
+When another context needs to enqueue work in this context, expose a public enqueue command on the
+facade. Outsiders never reach into `Workers.*`.
 
 ```elixir
 defmodule MyApp.Sales do
@@ -575,35 +568,29 @@ defmodule MyApp.Sales.Commands.EnqueueFulfillment do
 end
 ```
 
-Callers do `Sales.enqueue_fulfillment(scope, attrs)`; they never know `FulfillOrderWorker` exists.
+## Controller With Boundary Authorization
 
-## Controller (authorization at boundary)
-
-Controllers stay thin: validate request shape, **authorize**, call the facade, delegate response
-shaping to the JSON view module / serializer the codebase uses.
+Controllers authorize at the boundary, call the facade, and delegate JSON shaping to the project's
+view/serializer convention. The authorization module/helper shown here is deliberately web-layer,
+not part of `MyApp.Sales`.
 
 ```elixir
 defmodule MyAppWeb.OrderController do
   use MyAppWeb, :controller
 
   alias MyApp.Sales
-  alias MyApp.Sales.Policy  # only if a Policy module exists
+  alias MyAppWeb.SalesPolicy
 
   def create(conn, %{"order" => order_params}) do
     scope = conn.assigns.scope
 
-    with :ok <- Policy.authorize(scope, :place_order) do
+    with :ok <- SalesPolicy.authorize(scope, :place_order, order_params) do
       case Sales.place_order(scope, order_params) do
         {:ok, order} ->
           conn |> put_status(:created) |> render(:show, order: order)
 
         {:error, %Ecto.Changeset{} = changeset} ->
           conn |> put_status(:unprocessable_entity) |> render(:errors, changeset: changeset)
-
-        {:error, :empty_order} ->
-          conn
-          |> put_status(:unprocessable_entity)
-          |> render(:error, message: "Order must contain at least one line item")
 
         {:error, reason} ->
           conn |> put_status(:unprocessable_entity) |> render(:error, message: inspect(reason))
@@ -616,7 +603,7 @@ defmodule MyAppWeb.OrderController do
   def show(conn, %{"id" => id}) do
     scope = conn.assigns.scope
 
-    with :ok <- Policy.authorize(scope, :read_order, %{id: id}) do
+    with :ok <- SalesPolicy.authorize(scope, :read_order, %{id: id}) do
       case Sales.get_order(scope, %{id: id}) do
         {:ok, order} -> render(conn, :show, order: order)
         {:error, :not_found} -> send_resp(conn, 404, "")
@@ -628,11 +615,8 @@ defmodule MyAppWeb.OrderController do
 end
 ```
 
-> When the codebase has **no** Policy module, authorize at the plug or pipeline level instead, and
-> drop the `Policy.authorize` step here. Match the existing pattern.
->
-> The `render(:show, order: order)` call assumes a Phoenix 1.7 `MyAppWeb.OrderJSON` view module.
-> Detect and match the codebase's JSON shaping (view modules, custom serializers, JSONAPI).
+If authorization is handled by plugs, pipelines, or LiveView hooks, use those instead. Do not add a
+policy module under the bounded context.
 
 ## Migration
 
@@ -644,8 +628,8 @@ defmodule MyApp.Repo.Migrations.CreateSalesOrders do
     create table(:orders, primary_key: false) do
       add :id, :binary_id, primary_key: true
       add :customer_id, :binary_id
-      add :organization_id, :binary_id  # only if multi-tenant
-      add :tenant_id, :binary_id         # only if multi-tenant
+      add :organization_id, :binary_id
+      add :tenant_id, :binary_id
       add :status, :string
       add :placed_at, :utc_datetime
       add :total_cents, :integer, default: 0
@@ -655,7 +639,7 @@ defmodule MyApp.Repo.Migrations.CreateSalesOrders do
 
     create table(:order_line_items, primary_key: false) do
       add :id, :binary_id, primary_key: true
-      add :order_id, :binary_id
+      add :order_id, references(:orders, type: :binary_id, on_delete: :delete_all), null: false
       add :product_id, :binary_id
       add :sku, :string
       add :quantity, :integer
@@ -673,9 +657,5 @@ defmodule MyApp.Repo.Migrations.CreateSalesOrders do
 end
 ```
 
-> One context per migration file. In greenfield contexts still in active build-out, it's acceptable
-> to fold related migrations together when the user requests it. In mature contexts, each schema
-> change gets its own dated migration.
->
-> This migration matches the binary-id schema template. If the project uses integer ids, use the
-> existing generator convention instead of copying the binary-id primary key fields.
+Only include tenant fields/indexes when the project Scope and spec require them. If the project
+uses integer ids, use the existing generator convention instead of copying the binary-id fields.
