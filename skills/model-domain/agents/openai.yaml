@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model Domain"
+  short_description: "Model bounded contexts before coding"
+  default_prompt: "Use $model-domain to turn a product or system workflow into a bounded-context domain model with vocabulary, commands, queries, state transitions, invariants, and formal-modeling assessment."

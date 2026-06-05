@@ -15,6 +15,8 @@ npx skills add https://github.com/kokjinsam/agent-config/skills --skill tdd-elix
 - https://github.com/surma/pi-config/
 - https://github.com/badlogic/pi-skills/
 - https://github.com/baggiiiie/pi-stuff
+- https://github.com/tlaplus/AgentSkills/
+- https://github.com/younes-io/agent-skills/
 
 ## Useful Skills
 

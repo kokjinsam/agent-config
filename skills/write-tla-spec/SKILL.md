@@ -1,9 +1,9 @@
 ---
-name: tla-check
+name: write-tla-spec
 description: "Write and iteratively refine executable TLA+ specs (.tla) and TLC model configs (.cfg) from natural-language system designs; run TLC model checking; summarize pass/fail and counterexamples with explicit assumptions and bounds. Use when asked to design or validate a protocol/state machine, create or edit .tla/.cfg files, run TLC, or interpret TLC failures."
 ---
 
-# TLA+ Check
+# Write TLA+ Spec
 
 ## Outputs
 
@@ -95,9 +95,9 @@ If you introduce `CONSTRAINT` / `ACTION_CONSTRAINT`, call it out as a *coverage 
 Prereqs:
 - `java` on PATH
 - `jq` on PATH
-- `tla2tools.jar` available and pointed to by `TLA2TOOLS_JAR` (or pass `--jar`)
+- `tla2tools.jar` available from a project-local `.tla/tla2tools.jar`, `TLA2TOOLS_JAR`, or `--jar`
 
-Run (from the `tla-check` skill directory):
+Run (from the `write-tla-spec` skill directory):
 
 ```bash
 scripts/tlc_check.sh --spec path/to/Foo.tla --cfg path/to/Foo.cfg

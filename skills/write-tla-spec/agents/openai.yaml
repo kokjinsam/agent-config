@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write TLA+ Spec"
+  short_description: "Write and check TLA+ specs with TLC"
+  default_prompt: "Use $write-tla-spec to turn a natural-language system design into a minimal TLA+ spec (.tla) and TLC model config (.cfg), run TLC model checking, summarize results and counterexamples with explicit bounds and assumptions, and iterate until either properties pass within bounds or a counterexample remains."

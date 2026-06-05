@@ -1,9 +1,9 @@
 ---
-name: tla-proof
+name: prove-tla-spec
 description: "Write and iteratively refine TLA+ theorem proofs in `.tla` modules with TLAPS (`tlapm`); run proof checks and summarize proved vs failed/omitted obligations with explicit assumptions and trust boundaries. Use when asked to create or fix `THEOREM` or `PROOF` blocks, diagnose TLAPS failures, strengthen inductive invariants, prove equivalence, or tune proof structure."
 ---
 
-# TLA+ Proof
+# Prove TLA+ Spec
 
 ## Outputs
 
