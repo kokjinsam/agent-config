@@ -1,5 +1,5 @@
 ---
-name: write-tla-spec
+name: to-tla-spec
 description: "Write and iteratively refine executable TLA+ specs (.tla) and TLC model configs (.cfg) from natural-language system designs; run TLC model checking; summarize pass/fail and counterexamples with explicit assumptions and bounds. Use when asked to design or validate a protocol/state machine, create or edit .tla/.cfg files, run TLC, or interpret TLC failures."
 ---
 
@@ -97,7 +97,7 @@ Prereqs:
 - `jq` on PATH
 - `tla2tools.jar` available from a project-local `.tla/tla2tools.jar`, `TLA2TOOLS_JAR`, or `--jar`
 
-Run (from the `write-tla-spec` skill directory):
+Run (from the `to-tla-spec` skill directory):
 
 ```bash
 scripts/tlc_check.sh --spec path/to/Foo.tla --cfg path/to/Foo.cfg

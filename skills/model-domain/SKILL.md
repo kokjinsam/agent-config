@@ -22,7 +22,7 @@ It owns semantic authority and modeling judgment. It does not own formal executi
 
 - It does not write production code.
 - It does not write executable `.tla` or `.cfg` files or run TLC. If the user explicitly asks for
-  executable TLA+ work, use `write-tla-spec` when available.
+  executable TLA+ work, use `to-tla-spec` when available.
 - It does not create or debug `THEOREM`/`PROOF` obligations. If the user explicitly asks for TLAPS
   proof work, use `prove-tla-spec` when available.
 - It does not proactively recommend another skill. It may classify a transition as formal-modeling
