@@ -13,7 +13,7 @@ Usage:
 Options:
   --spec PATH           Path to root .tla module (required)
   --cfg PATH            Path to .cfg file (default: <spec>.cfg)
-  --jar PATH            Path to tla2tools.jar (default: project-local .tla/, $TLA2TOOLS_JAR, or guessed paths)
+  --jar PATH            Path to tla2tools.jar (default: $TLA2TOOLS_JAR, repo .tla/, or guessed paths)
   --java BIN            Java executable (default: java)
   --workers N           TLC workers (default: 1)
   --timeout-secs N      Kill TLC after N seconds (default: 0 = no timeout)
@@ -164,7 +164,7 @@ find_tla2tools_jar() {
   local env_jar
   local parent
   local candidate
-  local cwd_tla
+  local repo_root
   local guesses=()
 
   if [[ -n "$explicit" ]]; then
@@ -176,30 +176,20 @@ find_tla2tools_jar() {
     return 1
   fi
 
-  parent="$spec_dir"
-  while :; do
-    if [[ "$parent" != "$HOME" ]]; then
-      guesses+=("$parent/.tla/tla2tools.jar")
-    fi
-    [[ "$parent" == "/" ]] && break
-    parent="$(dirname "$parent")"
-  done
-
-  cwd_tla="$(pwd -P)/.tla/tla2tools.jar"
-  guesses+=("$cwd_tla")
-
   env_jar="${TLA2TOOLS_JAR:-}"
   if [[ -n "$env_jar" ]]; then
-    guesses+=("$(expand_user_path "$env_jar")")
+    candidate="$(expand_user_path "$env_jar")"
+    if [[ -f "$candidate" ]]; then
+      abs_path "$candidate"
+      return 0
+    fi
   fi
 
-  guesses+=("$HOME/.tla/tla2tools.jar")
-  guesses+=("$HOME/tla/tla2tools.jar")
-  guesses+=("$HOME/.local/lib/tla2tools.jar")
-  guesses+=("/usr/local/lib/tla2tools.jar")
-  guesses+=("/opt/tlaplus/tla2tools.jar")
-  guesses+=("/usr/local/Cellar/tla-plus/tla2tools.jar")
-  guesses+=("/opt/homebrew/lib/tla2tools.jar")
+  repo_root="$(git -C "$spec_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$repo_root" ]]; then
+    guesses+=("$repo_root/.tla/tla2tools.jar")
+  fi
+
   guesses+=("$spec_dir/tla2tools.jar")
   guesses+=("$spec_dir/dist/tla2tools.jar")
   guesses+=("$(pwd -P)/tla2tools.jar")
@@ -306,7 +296,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 jar_path="$(find_tla2tools_jar "$spec_dir" "$JAR" || true)"
 if [[ -z "$jar_path" ]]; then
   cat >&2 <<'EOF'
-tla2tools.jar not found. Place it in a project-local .tla/tla2tools.jar, set $TLA2TOOLS_JAR, or pass --jar.
+tla2tools.jar not found. Set $TLA2TOOLS_JAR, place it in repo .tla/tla2tools.jar, or pass --jar.
 If you're in the tlaplus/tlaplus repo, build it with:
   ant -f tlatools/org.lamport.tlatools/customBuild.xml default-maven
 and then use:
