@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Command"
+  short_description: "Write bounded-context command handlers"
+  default_prompt: "Use $write-command to write or review a public bounded-context command handler."
