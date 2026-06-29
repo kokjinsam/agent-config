@@ -1,6 +1,7 @@
 ---
-name: to-tla-spec
+name: tla-spec
 description: "Write and iteratively refine executable TLA+ specs (.tla) and TLC model configs (.cfg) from natural-language system designs; run TLC model checking."
+disable-model-invocation: true
 ---
 
 # Write TLA+ Spec
