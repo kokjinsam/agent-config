@@ -40,29 +40,7 @@ If a `CONTEXT-MAP.md` exists at the root, the repo has multiple contexts. The ma
 
 Create files lazily — only when you have something to write. If no `CONTEXT.md` exists, create one when the first term is resolved. If no `docs/adr/` exists, create it when the first ADR is needed.
 
-## Source Discovery
-
-Before inventing a model, look for existing sources. Use explicit user-named files first, then search
-the repo:
-
-1. `docs/specs/**/*.tla`
-2. `.tla/**/*.tla`
-3. other `*.tla`
-4. architecture docs such as `docs/architecture/**`, ADRs, and `CONTEXT.md`
-
-Treat TLA+ specs as the semantic source of truth when present. Use architecture docs as explainers,
-terminology support, or drift surfaces. If prose and TLA+ disagree, proceed from the TLA+ model and
-call out the prose drift. If the relevant TLA+ spec is ambiguous, incomplete, or there are competing
-specs for the same slice, ask before merging them into a synthetic model.
-
-Architecture-only semantics are candidate semantics until the user confirms them or an authoritative
-model encodes them.
-
 ## During the session
-
-## Scope the bounded context
-
-Name what the model covers and where it stops. If the slice mixes unrelated languages, recommend splitting. If several workflows share state, ask whether to model them together, separately with the shared variable called out, or one in scope and the other out.
 
 ### Challenge against the glossary
 
@@ -99,39 +77,3 @@ Only offer to create an ADR when all three are true:
 3. **The result of a real trade-off** — there were genuine alternatives and you picked one for specific reasons
 
 If any of the three is missing, skip the ADR. Use the format in [ADR-FORMAT.md](./ADR-FORMAT.md).
-
-## Formal-Modeling
-
-Ask:
-
-> Would a wrong state transition cause serious business, financial, operational, or user harm?
-
-High-risk examples: payment capture, inventory reservation, entitlement grants, booking lifecycles,
-ownership transfer, duplicate/retry handling, out-of-order events, worker crashes, partial failures,
-and cross-context handoffs.
-
-Low-risk examples: CRUD admin screens, reporting queries, basic settings pages, and workflows where a
-wrong transition is easy to detect and undo.
-
-When risk is high, state the call and why: "formal modeling is warranted because duplicate capture
-could violate the money-movement invariant." If useful, describe the domain shape in plain terms:
-single bounded context, risky workflow slice, or cross-context handoff.
-
-When formal modeling is warranted, state why in domain terms and stop. Do not choose the classify,
-write `.tla`/`.cfg`, or run TLC here. If the user asks to proceed with executable formal modeling,
-spec validation, TLC, or handoff material for that work, use `/to-tla-spec`.
-
-## Optional Handoff Material
-
-Only when the user asks for handoff material, write a compact requirement ledger:
-
-```markdown
-| Natural-language rule           | State/transition/invariant/not modeled |
-| ------------------------------- | -------------------------------------- |
-| Payment is never captured twice | invariant: CapturedAtMostOnce          |
-| Retry timing                    | not modeled                            |
-```
-
-Include authoritative source files, architecture drift notes, and intentionally abstracted-away
-details. Do not include formal spec-layer classification, finite bounds, `.cfg` prep, or TLC
-execution assumptions. Do not make this a required deliverable for normal domain modeling.
