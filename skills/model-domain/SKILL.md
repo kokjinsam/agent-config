@@ -1,32 +1,44 @@
 ---
 name: model-domain
-description: >
-  Model a business domain before implementation: discover existing semantic authorities, capture
-  bounded-context vocabulary and ownership, separate commands from queries, state variables,
-  transitions, invariants, and intentionally abstracted-away details. Treat TLA+ specs as source of
-  truth when present and architecture docs as explainers or drift surfaces. Decide whether formal
-  modeling is warranted and which TLA+ layer applies, but do not write executable .tla/.cfg files,
-  run TLC, or create proofs. Use whenever the user wants to model a domain, design a workflow or
-  state machine, reason about invariants, or structure a bounded context.
+description: "Build and sharpen a project's domain model. Use when the user wants to pin down domain terminology or a ubiquitous language, record an architectural decision, or when another skill needs to maintain the domain model."
+disable-model-invocation: true
 ---
 
-# Model Domain
+# Domain Modeling
 
-This skill is the front door for domain design. It turns product or system intent into bounded
-context shape: vocabulary, ownership boundary, commands, queries, state variables, transitions,
-invariants, and what the model intentionally leaves out.
+Actively build and sharpen the project's domain model as you design. This is the _active_ discipline — challenging terms, inventing edge-case scenarios, and writing the glossary and decisions down the moment they crystallise. (Merely _reading_ `CONTEXT.md` for vocabulary is not this skill — that's a one-line habit any skill can do. This skill is for when you're changing the model, not just consuming it.)
 
-It owns semantic authority and modeling judgment. It does not own formal execution evidence.
+## File structure
 
-## What this skill is not
+Most repos have a single context:
 
-- It does not write production code.
-- It does not write executable `.tla` or `.cfg` files or run TLC. If the user explicitly asks for
-  executable TLA+ work, use `to-tla-spec` when available.
-- It does not create or debug `THEOREM`/`PROOF` obligations. If the user explicitly asks for TLAPS
-  proof work, use `prove-tla-spec` when available.
-- It does not proactively recommend another skill. It may classify a transition as formal-modeling
-  worthy, then stop unless the user asks for handoff or executable formal work.
+```
+/
+├── CONTEXT.md
+├── docs/
+│   └── adr/
+│       ├── 0001-event-sourced-orders.md
+│       └── 0002-postgres-for-write-model.md
+└── src/
+```
+
+If a `CONTEXT-MAP.md` exists at the root, the repo has multiple contexts. The map points to where each one lives:
+
+```
+/
+├── CONTEXT-MAP.md
+├── docs/
+│   └── adr/                          ← system-wide decisions
+├── src/
+│   ├── ordering/
+│   │   ├── CONTEXT.md
+│   │   └── docs/adr/                 ← context-specific decisions
+│   └── billing/
+│       ├── CONTEXT.md
+│       └── docs/adr/
+```
+
+Create files lazily — only when you have something to write. If no `CONTEXT.md` exists, create one when the first term is resolved. If no `docs/adr/` exists, create it when the first ADR is needed.
 
 ## Source Discovery
 
@@ -43,56 +55,52 @@ terminology support, or drift surfaces. If prose and TLA+ disagree, proceed from
 call out the prose drift. If the relevant TLA+ spec is ambiguous, incomplete, or there are competing
 specs for the same slice, ask before merging them into a synthetic model.
 
-Architecture-only semantics are candidate semantics until they are mapped to a TLA+ construct or the
-user confirms they are intended.
+Architecture-only semantics are candidate semantics until the user confirms them or an authoritative
+model encodes them.
 
-## TLA+ Authority Layers
+## During the session
 
-When existing or proposed TLA+ specs are relevant, classify the layer:
+## Scope the bounded context
 
-- **Bounded context system spec**: one canonical spec per small bounded context. It owns vocabulary,
-  state variables, core transitions, and invariants.
-- **Workflow proof spec**: a small projection of a context system spec for a risky workflow or
-  transition family. It should say it is a slice of `<ContextSystem>.tla`, reuse names where possible,
-  and avoid parallel vocabulary. If it needs semantics missing from the system spec, mark it
-  exploratory or flag that the system spec needs an update.
-- **Integration spec**: a cross-context coordination model for handoffs, bridges, accepted/rejected
-  events, ownership transfer, eventual consistency, duplicate delivery, and similar contracts. It
-  must not redefine each context's internals.
+Name what the model covers and where it stops. If the slice mixes unrelated languages, recommend splitting. If several workflows share state, ask whether to model them together, separately with the shared variable called out, or one in scope and the other out.
 
-If a single system spec is growing into a giant executable architecture document, say so. Either the
-bounded context is too broad, or the spec should be decomposed into TLA modules while preserving one
-named context-level authority.
+### Challenge against the glossary
 
-For integration spec names, use descriptive relationship names such as
-`SalesOrderPaymentAcceptance.tla`, `SalesOrderShippingSchedule.tla`, or `ProtocolActivationHandoff.tla`.
-Avoid vague names like `Integration.tla`, `CrossContext.tla`, `Workflow.tla`, or `Bridge.tla`.
+When the user uses a term that conflicts with the existing language in `CONTEXT.md`, call it out immediately. "Your glossary defines 'cancellation' as X, but you seem to mean Y — which is it?"
 
-## Workflow
+### Sharpen fuzzy language
 
-Do these in order, looping back as needed:
+When the user uses vague or overloaded terms, propose a precise canonical term. "You're saying 'account' — do you mean the Customer or the User? Those are different things."
 
-1. **Capture the domain language.** Use the business's nouns and verbs: "payment must be authorized
-   before shipping", "a booking cannot be checked in before it is confirmed". These sentences become
-   commands, events, state variables, and invariants.
-2. **Scope the bounded context.** Name what the model covers and where it stops. If the slice mixes
-   unrelated languages, recommend splitting. If several workflows share state, ask whether to model
-   them together, separately with the shared variable called out, or one in scope and the other out.
-3. **Separate commands from queries.** Commands express intent and change state
-   (`AuthorizePayment`, `ShipOrder`); queries read state for display (`GetOrderSummary`). Commands
-   protect invariants. Queries never change business state.
-4. **Name state variables.** Prefer state-shaped names over storage-shaped names:
-   `orderStatus`, `paymentAuthorized`, `acceptedFullTextAvailable`.
-5. **Sketch transitions.** State which command or event moves which variable from which value to
-   which value, and which preconditions guard it.
-6. **State invariants.** Write flat rules that must hold in every reachable state, not code paths:
-   "an order is never shipped unless payment is authorized", "a payment is never captured twice".
-7. **Apply the formal-modeling risk gate.** Decide whether the transition is formal-modeling-worthy,
-   and which TLA+ layer would own it. Do not write or run the spec here.
-8. **List intentionally abstracted-away details.** Call out HTTP, schemas, workers, brokers, auth,
-   retries' exact timing, UI, metrics, or anything else deliberately omitted.
+## Separate commands from queries.
 
-## Formal-Modeling Risk Gate
+Commands express intent and change state (`AuthorizePayment`, `ShipOrder`); queries read state for display (`GetOrderSummary`). Commands protect invariants. Queries never change business state.
+
+### Discuss concrete scenarios
+
+When domain relationships are being discussed, stress-test them with specific scenarios. Invent scenarios that probe edge cases and force the user to be precise about the boundaries between concepts.
+
+### Cross-reference with code
+
+When the user states how something works, check whether the code agrees. If you find a contradiction, surface it: "Your code cancels entire Orders, but you just said partial cancellation is possible — which is right?"
+
+### Update CONTEXT.md inline
+
+When a term is resolved, update `CONTEXT.md` right there. Don't batch these up — capture them as they happen. Use the format in [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md).
+
+`CONTEXT.md` should be totally devoid of implementation details. Do not treat `CONTEXT.md` as a spec, a scratch pad, or a repository for implementation decisions. It is a glossary and nothing else.
+
+### Offer ADRs sparingly
+
+Only offer to create an ADR when all three are true:
+
+1. **Hard to reverse** — the cost of changing your mind later is meaningful
+2. **Surprising without context** — a future reader will wonder "why did they do it this way?"
+3. **The result of a real trade-off** — there were genuine alternatives and you picked one for specific reasons
+
+If any of the three is missing, skip the ADR. Use the format in [ADR-FORMAT.md](./ADR-FORMAT.md).
+
+## Formal-Modeling
 
 Ask:
 
@@ -106,71 +114,24 @@ Low-risk examples: CRUD admin screens, reporting queries, basic settings pages, 
 wrong transition is easy to detect and undo.
 
 When risk is high, state the call and why: "formal modeling is warranted because duplicate capture
-could violate the money-movement invariant." Do not proactively recommend another skill or create
-handoff material unless the user asks.
+could violate the money-movement invariant." If useful, describe the domain shape in plain terms:
+single bounded context, risky workflow slice, or cross-context handoff.
+
+When formal modeling is warranted, state why in domain terms and stop. Do not choose the classify,
+write `.tla`/`.cfg`, or run TLC here. If the user asks to proceed with executable formal modeling,
+spec validation, TLC, or handoff material for that work, use `/to-tla-spec`.
 
 ## Optional Handoff Material
 
 Only when the user asks for handoff material, write a compact requirement ledger:
 
 ```markdown
-| Natural-language rule           | State/action/invariant/property/not modeled |
-| ------------------------------- | ------------------------------------------- |
-| Payment is never captured twice | invariant: CapturedAtMostOnce               |
-| Retry timing                    | not modeled                                 |
+| Natural-language rule           | State/transition/invariant/not modeled |
+| ------------------------------- | -------------------------------------- |
+| Payment is never captured twice | invariant: CapturedAtMostOnce          |
+| Retry timing                    | not modeled                            |
 ```
 
-Include spec layer, authoritative source files, architecture drift notes, environment/failure model,
-proposed finite bounds if known, and intentionally abstracted-away details. Do not make this a
-required deliverable for normal domain modeling.
-
-## The Architecture Document
-
-The normal deliverable is a concise domain model or architecture note. Detect the repo's conventions
-for where docs live and ask if placement is ambiguous. Include:
-
-```markdown
-# <Bounded Context> domain model
-
-## Sources
-
-Authoritative TLA+ specs, explanatory architecture docs, and any drift found.
-
-## Bounded context
-
-What this model covers and, importantly, where it stops.
-
-## Ubiquitous language
-
-The domain terms and the business sentences they came from.
-
-## Commands
-
-The intents that change state.
-
-## Queries
-
-The reads, kept separate from commands.
-
-## State variables
-
-The safety-relevant state named in domain language.
-
-## State transitions
-
-Which command or event moves which state from which value to which value.
-
-## Invariants
-
-The rules that must always hold, as flat statements about state.
-
-## Formal-modeling assessment
-
-Whether formal modeling is warranted, which TLA+ layer would own it, and why.
-
-## Intentionally abstracted away
-
-The explicit list of what the model and doc leave out.
-```
-
-Keep the model small, the language clear, and the architecture honest.
+Include authoritative source files, architecture drift notes, and intentionally abstracted-away
+details. Do not include formal spec-layer classification, finite bounds, `.cfg` prep, or TLC
+execution assumptions. Do not make this a required deliverable for normal domain modeling.

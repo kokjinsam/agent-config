@@ -1,4 +1,0 @@
-interface:
-  display_name: "Prove TLA+ Spec"
-  short_description: "Write and debug TLA+ proofs with TLAPS"
-  default_prompt: "Use $prove-tla-spec to build or fix hierarchical TLA+ proofs, run TLAPS, and summarize proved versus unproved obligations with assumptions."
