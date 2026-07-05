@@ -1,7 +1,7 @@
-defmodule CodeStyle.Credo.NoDatabaseConstraintsTest do
+defmodule CodeStyle.Check.Design.NoDatabaseConstraintsTest do
   use Credo.Test.Case, async: false
 
-  alias CodeStyle.Credo.NoDatabaseConstraints
+  alias CodeStyle.Check.Design.NoDatabaseConstraints
 
   setup_all do
     Application.ensure_all_started(:credo)

@@ -1,4 +1,4 @@
-defmodule CodeStyle.Credo.NoDatabaseConstraints do
+defmodule CodeStyle.Check.Design.NoDatabaseConstraints do
   @moduledoc false
 
   use Credo.Check,

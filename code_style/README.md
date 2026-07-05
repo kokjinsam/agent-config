@@ -13,11 +13,11 @@ Add `code_style` to a consuming Mix project:
 Then enable the check in `.credo.exs`:
 
 ```elixir
-{CodeStyle.Credo.NoDatabaseConstraints, []}
+{CodeStyle.Check.Design.NoDatabaseConstraints, []}
 {CodeStyle.Check.Warning.RepoInsideLoop, []}
 ```
 
-`CodeStyle.Credo.NoDatabaseConstraints` flags business-logic column options in
+`CodeStyle.Check.Design.NoDatabaseConstraints` flags business-logic column options in
 Ecto migration table blocks. The rule is intentionally copied from Remark
 without behavior changes.
 
