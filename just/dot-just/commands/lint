@@ -8,6 +8,8 @@ declare -a STYLELINT_PATHS=()
 declare -a LINT_SELECTORS=()
 declare -a MIX_LINT_ROOTS=()
 
+JUST_STEP_REPORT_STYLE="lint-table"
+
 default_lint_paths() {
   local app
   local path
@@ -20,6 +22,38 @@ default_lint_paths() {
   for path in "$REPO_ROOT/oxlint.config.ts" "$REPO_ROOT/stylelint.config.js"; do
     [[ -e "$path" ]] && printf "%s\n" "$path"
   done
+}
+
+normalize_path() {
+  local path="$1"
+  local dir
+  local base
+
+  if [[ -d "$path" ]]; then
+    (cd "$path" && pwd)
+    return
+  fi
+
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+
+  printf "%s/%s\n" "$(cd "$dir" && pwd)" "$base"
+}
+
+lint_tool_path() {
+  local path="$1"
+  local relative
+
+  relative="$(relative_path "$path")"
+
+  case "$relative" in
+    -*)
+      printf "./%s\n" "$relative"
+      ;;
+    *)
+      printf "%s\n" "$relative"
+      ;;
+  esac
 }
 
 add_mix_lint_root() {
@@ -52,16 +86,16 @@ add_lint_file() {
       add_mix_lint_root "$root"
       ;;
     *.css)
-      STYLELINT_PATHS+=("$(relative_path "$file")")
+      STYLELINT_PATHS+=("$(lint_tool_path "$file")")
       ;;
     *.astro)
       return
       ;;
     *.cjs|*.cts|*.js|*.jsx|*.mjs|*.mts|*.ts|*.tsx)
-      OXLINT_PATHS+=("$(relative_path "$file")")
+      OXLINT_PATHS+=("$(lint_tool_path "$file")")
       ;;
     *)
-      OXLINT_PATHS+=("$(relative_path "$file")")
+      OXLINT_PATHS+=("$(lint_tool_path "$file")")
       ;;
   esac
 }
@@ -72,6 +106,15 @@ add_lint_path() {
 
   path="$(resolve_path "$1")"
   [[ -e "$path" ]] || die "path does not exist: $path"
+  path="$(normalize_path "$path")"
+
+  if [[ "$path" == "$REPO_ROOT" ]]; then
+    while IFS= read -r path; do
+      add_lint_path "$path"
+    done < <(default_lint_paths)
+
+    return
+  fi
 
   if [[ -d "$path" ]]; then
     if root="$(elixir_root_for_path "$path")"; then
@@ -162,7 +205,7 @@ selector_display_suffix() {
   fi
 }
 
-lint_summary_details() {
+lint_files_summary() {
   local count="$1"
   local label
   local unit="files"
@@ -174,7 +217,57 @@ lint_summary_details() {
   fi
 
   [[ "$count" -eq 1 ]] && unit="file"
-  printf "  files: %s (%s %s)" "$label" "$count" "$unit"
+  printf "%s (%s %s)" "$label" "$count" "$unit"
+}
+
+lint_summary_details() {
+  local count="$1"
+
+  printf "  files: %s" "$(lint_files_summary "$count")"
+}
+
+lint_tool_step() {
+  local label="$1"
+  local cwd="$2"
+  local files="$3"
+
+  shift 3
+  JUST_STEP_REPORT_KIND="tool" JUST_STEP_REPORT_EXTRA="$files" collect_step "$label" "$cwd" "$@"
+}
+
+file_contains_uncommented_regex() {
+  local file="$1"
+  local pattern="$2"
+
+  [[ -f "$file" ]] || return 1
+
+  awk -v pattern="$pattern" '
+    /^[[:space:]]*#/ {
+      next
+    }
+
+    $0 ~ pattern {
+      found = 1
+    }
+
+    END {
+      exit found ? 0 : 1
+    }
+  ' "$file"
+}
+
+preflight_step() {
+  local label="$1"
+  local root="$2"
+  local requirement="$3"
+  local display_command="$4"
+
+  shift 4
+  JUST_STEP_REPORT_KIND="preflight" \
+    JUST_STEP_REPORT_EXTRA="$requirement" \
+    JUST_STEP_DISPLAY_COMMAND="$display_command" \
+    JUST_STEP_DISPLAY_DETAILS="  requires: $requirement" \
+    collect_step "$label" "$root" "$@"
 }
 
 run_oxlint() {
@@ -193,7 +286,7 @@ run_oxlint() {
   display_command="pnpm exec oxlint$(selector_display_suffix)"
   details="$(lint_summary_details "${#paths[@]}")"
   JUST_STEP_DISPLAY_COMMAND="$display_command" JUST_STEP_DISPLAY_DETAILS="$details" \
-    collect_step "Oxlint" "$REPO_ROOT" pnpm exec oxlint "${paths[@]}"
+    lint_tool_step "Oxlint" "$REPO_ROOT" "$(lint_files_summary "${#paths[@]}")" pnpm exec oxlint "${paths[@]}"
 }
 
 run_stylelint() {
@@ -212,19 +305,67 @@ run_stylelint() {
   display_command="pnpm exec stylelint$(selector_display_suffix)"
   details="$(lint_summary_details "${#paths[@]}")"
   JUST_STEP_DISPLAY_COMMAND="$display_command" JUST_STEP_DISPLAY_DETAILS="$details" \
-    collect_step "Stylelint" "$REPO_ROOT" pnpm exec stylelint "${paths[@]}"
+    lint_tool_step "Stylelint" "$REPO_ROOT" "$(lint_files_summary "${#paths[@]}")" pnpm exec stylelint "${paths[@]}"
 }
 
-check_ex_slop_contract() {
+check_elixir_lint_contract() {
   local root="$1"
-  local dependency_details="  requires: {:ex_slop, ...} in mix.exs"
-  local plugin_details="  requires: plugins: [{ExSlop, ...}] in .credo.exs"
 
-  JUST_STEP_DISPLAY_COMMAND="grep -Eq '{[[:space:]]*:ex_slop[[:space:]]*,' mix.exs" JUST_STEP_DISPLAY_DETAILS="$dependency_details" \
-    collect_step "ExSlop Dependency" "$root" grep -Eq '\{[[:space:]]*:ex_slop[[:space:]]*,' mix.exs
+  preflight_step \
+    "ExSlop Dependency" \
+    "$root" \
+    "{:ex_slop, ...} in mix.exs" \
+    "grep -Eq '{[[:space:]]*:ex_slop[[:space:]]*,' mix.exs" \
+    file_contains_uncommented_regex mix.exs '\{[[:space:]]*:ex_slop[[:space:]]*,'
 
-  JUST_STEP_DISPLAY_COMMAND="grep -Eq '{[[:space:]]*ExSlop[[:space:]]*,' .credo.exs" JUST_STEP_DISPLAY_DETAILS="$plugin_details" \
-    collect_step "ExSlop Credo Plugin" "$root" bash -c "test -f .credo.exs && grep -Eq '\\{[[:space:]]*ExSlop[[:space:]]*,' .credo.exs"
+  preflight_step \
+    "ExSlop Credo Plugin" \
+    "$root" \
+    "{ExSlop, ...} in .credo.exs plugins" \
+    "grep -Eq '{[[:space:]]*ExSlop[[:space:]]*,' .credo.exs" \
+    file_contains_uncommented_regex .credo.exs '\{[[:space:]]*ExSlop[[:space:]]*,'
+
+  preflight_step \
+    "ExcellentMigrations Dependency" \
+    "$root" \
+    "{:excellent_migrations, ...} in mix.exs" \
+    "grep -Eq '{[[:space:]]*:excellent_migrations[[:space:]]*,' mix.exs" \
+    file_contains_uncommented_regex mix.exs '\{[[:space:]]*:excellent_migrations[[:space:]]*,'
+
+  preflight_step \
+    "ExcellentMigrations Credo Check" \
+    "$root" \
+    "ExcellentMigrations.CredoCheck.MigrationsSafety in .credo.exs" \
+    "grep -Eq 'ExcellentMigrations[.]CredoCheck[.]MigrationsSafety' .credo.exs" \
+    file_contains_uncommented_regex .credo.exs 'ExcellentMigrations[.]CredoCheck[.]MigrationsSafety'
+
+  preflight_step \
+    "CodeStyle Dependency" \
+    "$root" \
+    "{:code_style, ...} in mix.exs" \
+    "grep -Eq '{[[:space:]]*:code_style[[:space:]]*,' mix.exs" \
+    file_contains_uncommented_regex mix.exs '\{[[:space:]]*:code_style[[:space:]]*,'
+
+  preflight_step \
+    "CodeStyle Credo Check" \
+    "$root" \
+    "CodeStyle.* check in .credo.exs" \
+    "grep -Eq 'CodeStyle[.]' .credo.exs" \
+    file_contains_uncommented_regex .credo.exs 'CodeStyle[.]'
+
+  preflight_step \
+    "Styler Dependency" \
+    "$root" \
+    "{:styler, ...} in mix.exs" \
+    "grep -Eq '{[[:space:]]*:styler[[:space:]]*,' mix.exs" \
+    file_contains_uncommented_regex mix.exs '\{[[:space:]]*:styler[[:space:]]*,'
+
+  preflight_step \
+    "Styler Formatter" \
+    "$root" \
+    "Styler in .formatter.exs plugins" \
+    "grep -Eq 'Styler' .formatter.exs" \
+    file_contains_uncommented_regex .formatter.exs 'Styler'
 }
 
 run_mix_lint() {
@@ -240,30 +381,46 @@ run_mix_lint() {
   require_command mix
 
   for root in "${roots[@]}"; do
-    collect_step "Mix Format" "$root" mix format --check-formatted
-    check_ex_slop_contract "$root"
-    collect_step "Credo" "$root" mix credo --strict
-    collect_step "Sobelow" "$root" mix sobelow --private --exit --threshold high
-    collect_step "ExDNA" "$root" mix ex_dna --min-mass 40 --max-clones 0
-    collect_step "Reach" "$root" mix reach.check --arch --smells --strict
-    collect_step "Dialyzer" "$root" mix dialyzer --format short
+    check_elixir_lint_contract "$root"
+    lint_tool_step "Mix Format" "$root" "app" mix format --check-formatted
+    lint_tool_step "Credo" "$root" "app" mix credo --strict
+    lint_tool_step "Sobelow" "$root" "app" mix sobelow --private --exit --threshold high
+    lint_tool_step "ExDNA" "$root" "app" mix ex_dna --min-mass 40 --max-clones 0
+    lint_tool_step "Reach" "$root" "app" mix reach.check --arch --smells --strict
   done
 }
 
 main() {
   local path
+  local saw_path=0
+  local stop_options=0
 
   cd "$REPO_ROOT"
 
-  if [[ "$#" -eq 0 ]]; then
+  while [[ "$#" -gt 0 ]]; do
+    if [[ "$stop_options" -eq 0 ]]; then
+      case "$1" in
+        --)
+          stop_options=1
+          shift
+          continue
+          ;;
+        -*)
+          die "unknown lint option: $1"
+          ;;
+      esac
+    fi
+
+    saw_path=1
+    LINT_SELECTORS+=("$1")
+    add_lint_path "$1"
+    shift
+  done
+
+  if [[ "$saw_path" -eq 0 ]]; then
     while IFS= read -r path; do
       add_lint_path "$path"
     done < <(default_lint_paths)
-  else
-    for path in "$@"; do
-      LINT_SELECTORS+=("$path")
-      add_lint_path "$path"
-    done
   fi
 
   if [[ "${#OXLINT_PATHS[@]}" -eq 0 && "${#STYLELINT_PATHS[@]}" -eq 0 && "${#MIX_LINT_ROOTS[@]}" -eq 0 ]]; then

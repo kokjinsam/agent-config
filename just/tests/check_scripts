@@ -89,6 +89,23 @@ assert_output_matches() {
   fi
 }
 
+assert_output_before() {
+  local output="$1"
+  local first="$2"
+  local second="$3"
+  local first_line
+  local second_line
+
+  first_line="$(grep -Fn -- "$first" "$output" | head -n 1 | cut -d: -f1)"
+  second_line="$(grep -Fn -- "$second" "$output" | head -n 1 | cut -d: -f1)"
+
+  if [[ -z "$first_line" || -z "$second_line" || "$first_line" -ge "$second_line" ]]; then
+    printf "expected output to contain '%s' before '%s'\n" "$first" "$second" >&2
+    print_file "$output"
+    return 1
+  fi
+}
+
 assert_file_contains() {
   local file="$1"
   local expected="$2"
@@ -180,6 +197,9 @@ defmodule Api.MixProject do
     defp deps do
       [
         {:ex_slop, "0.4.2", only: [:dev, :test], runtime: false},
+        {:excellent_migrations, "~> 0.1.10", only: [:dev, :test], runtime: false},
+        {:code_style, path: "../../../../agent-config/code_style", only: [:dev, :test], runtime: false},
+        {:styler, "~> 1.5", only: [:dev, :test], runtime: false},
         {:phoenix, "~> 1.8"},
         {:uniq, "0.6.3"}
       ]
@@ -204,6 +224,9 @@ defmodule Api.MixProject do
     defp deps do
       [
         {:ex_slop, "0.4.2", only: [:dev, :test], runtime: false},
+        {:excellent_migrations, "~> 0.1.10", only: [:dev, :test], runtime: false},
+        {:code_style, path: "../../../../agent-config/code_style", only: [:dev, :test], runtime: false},
+        {:styler, "~> 1.5", only: [:dev, :test], runtime: false},
         {:phoenix, "~> 1.8"}
       ]
     end
@@ -270,7 +293,21 @@ YAML
   printf "default:\n" > "$fixture/Justfile"
 
   printf "body { color: black; }\n" > "$fixture/apps/api/assets/css/app.css"
-  printf "%%{configs: [%%{name: \"default\", plugins: [{ExSlop, []}], checks: []}]}\n" > "$fixture/apps/api/.credo.exs"
+  cat > "$fixture/apps/api/.credo.exs" <<'ELIXIR'
+%{
+  configs: [
+    %{
+      name: "default",
+      plugins: [{ExSlop, []}],
+      checks: [
+        {ExcellentMigrations.CredoCheck.MigrationsSafety, []},
+        {CodeStyle.Check.Design.NoDatabaseConstraints, []}
+      ]
+    }
+  ]
+}
+ELIXIR
+  printf "[plugins: [Phoenix.LiveView.HTMLFormatter, Styler]]\n" > "$fixture/apps/api/.formatter.exs"
   printf "defmodule Api do\nend\n" > "$fixture/apps/api/lib/api.ex"
   write_mix_exs "$fixture/apps/api/mix.exs"
   printf '{"scripts":{"build":"vite build","test":"vitest run","typecheck":"tsgo --noEmit"}}\n' > "$fixture/apps/workspace/package.json"
@@ -470,8 +507,8 @@ test_path_selected_summary_uses_selector_and_pluralization() {
 
   run_wrapper status output "$fixture" "$fixture" lint apps/workspace/src
   assert_status 0 "$status" "$output" || return
-  assert_output_contains "$output" "cmd: pnpm exec oxlint apps/workspace/src" || return
-  assert_output_contains "$output" "files: apps/workspace/src (2 files)" || return
+  assert_output_contains "$output" "pnpm exec oxlint apps/workspace/src" || return
+  assert_output_contains "$output" "apps/workspace/src (2 files)" || return
 }
 
 test_default_lint_summary_uses_repo_defaults() {
@@ -484,8 +521,59 @@ test_default_lint_summary_uses_repo_defaults() {
   run_wrapper status output "$fixture" "$fixture" lint
 
   assert_status 0 "$status" "$output" || return
-  assert_output_matches "$output" "files: repo defaults \\([0-9]+ files\\)" || return
+  assert_output_contains "$output" "Check" || return
+  assert_output_contains "$output" "Requirement" || return
+  assert_output_contains "$output" "Linter" || return
+  assert_output_contains "$output" "Files" || return
+  assert_output_before "$output" "Check" "Linter" || return
+  assert_output_matches "$output" "repo defaults \\([0-9]+ files\\)" || return
   assert_output_not_contains "$output" "default lint paths" || return
+}
+
+test_lint_repo_root_selector_runs_default_contract() {
+  local fixture
+  local output
+  local status
+
+  fixture="$(new_fixture)"
+
+  run_wrapper status output "$fixture" "$fixture" lint .
+
+  assert_status 0 "$status" "$output" || return
+  assert_log_entry "$fixture" mix "$fixture/apps/api" credo --strict || return
+  assert_log_entry "$fixture" pnpm "$fixture" exec oxlint apps/workspace/src/main.tsx apps/workspace/src/secondary.ts apps/website/src/site.ts oxlint.config.ts stylelint.config.js || return
+  assert_log_entry "$fixture" pnpm "$fixture" exec stylelint apps/api/assets/css/app.css || return
+}
+
+test_lint_accepts_end_of_options_path() {
+  local fixture
+  local output
+  local status
+
+  fixture="$(new_fixture)"
+  printf "export const optionPath = 1\n" > "$fixture/-x.js"
+
+  run_wrapper status output "$fixture" "$fixture" lint -- -x.js
+
+  assert_status 0 "$status" "$output" || return
+  assert_log_entry "$fixture" pnpm "$fixture" exec oxlint ./-x.js || return
+  assert_output_not_contains "$output" "path does not exist" || return
+}
+
+test_lint_preflight_failure_reports_and_continues() {
+  local fixture
+  local output
+  local status
+
+  fixture="$(new_fixture)"
+  printf "[]\n" > "$fixture/apps/api/.formatter.exs"
+
+  run_wrapper status output "$fixture" "$fixture" lint apps/api
+
+  assert_nonzero_status "$status" "$output" || return
+  assert_output_matches "$output" "Styler Formatter[[:space:]]+failed\\(1\\)" || return
+  assert_output_matches "$output" "Credo[[:space:]]+passed" || return
+  assert_log_entry "$fixture" mix "$fixture/apps/api" credo --strict || return
 }
 
 test_lint_aggregates_after_failing_sobelow() {
@@ -498,16 +586,20 @@ test_lint_aggregates_after_failing_sobelow() {
   JUST_FAKE_MIX_SOBELOW_STATUS=44 run_wrapper status output "$fixture" "$fixture" lint
 
   assert_nonzero_status "$status" "$output" || return
-  assert_output_contains "$output" "[failed exit 44] Sobelow" || return
-  assert_output_contains "$output" "[ok] ExSlop Dependency" || return
-  assert_output_contains "$output" "[ok] ExSlop Credo Plugin" || return
-  assert_output_contains "$output" "[ok] ExDNA" || return
-  assert_output_contains "$output" "[ok] Reach" || return
-  assert_output_contains "$output" "[ok] Dialyzer" || return
-  assert_output_contains "$output" "[ok] Oxlint" || return
-  assert_output_contains "$output" "[ok] Stylelint" || return
+  assert_output_matches "$output" "Sobelow[[:space:]]+failed\\(44\\)" || return
+  assert_output_matches "$output" "ExSlop Dependency[[:space:]]+passed" || return
+  assert_output_matches "$output" "ExSlop Credo Plugin[[:space:]]+passed" || return
+  assert_output_matches "$output" "ExcellentMigrations Dependency[[:space:]]+passed" || return
+  assert_output_matches "$output" "CodeStyle Dependency[[:space:]]+passed" || return
+  assert_output_matches "$output" "Styler Formatter[[:space:]]+passed" || return
+  assert_output_matches "$output" "ExDNA[[:space:]]+passed" || return
+  assert_output_matches "$output" "Reach[[:space:]]+passed" || return
+  assert_output_matches "$output" "Oxlint[[:space:]]+passed" || return
+  assert_output_matches "$output" "Stylelint[[:space:]]+passed" || return
+  assert_output_not_contains "$output" "Dialyzer" || return
   assert_log_not_contains "$fixture" "ex_slop" || return
-  assert_log_entry "$fixture" mix "$fixture/apps/api" dialyzer --format short || return
+  assert_log_not_contains "$fixture" "dialyzer" || return
+  assert_log_entry "$fixture" mix "$fixture/apps/api" reach.check --arch --smells --strict || return
   assert_log_entry "$fixture" pnpm "$fixture" exec oxlint apps/workspace/src/main.tsx apps/workspace/src/secondary.ts apps/website/src/site.ts oxlint.config.ts stylelint.config.js || return
   assert_log_entry "$fixture" pnpm "$fixture" exec stylelint apps/api/assets/css/app.css || return
 }
@@ -638,6 +730,9 @@ run_suite() {
     test_default_format_summary_uses_repo_defaults
     test_path_selected_summary_uses_selector_and_pluralization
     test_default_lint_summary_uses_repo_defaults
+    test_lint_repo_root_selector_runs_default_contract
+    test_lint_accepts_end_of_options_path
+    test_lint_preflight_failure_reports_and_continues
     test_lint_aggregates_after_failing_sobelow
     test_format_check_aggregates_formatter_failures
     test_install_hex_dep_uses_temp_mix_exs_and_compact_summary

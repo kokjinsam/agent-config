@@ -17,6 +17,8 @@ JUST_STEP_COMMANDS=()
 JUST_STEP_DETAILS=()
 JUST_STEP_STATUSES=()
 JUST_STEP_DURATIONS=()
+JUST_STEP_KINDS=()
+JUST_STEP_EXTRAS=()
 
 die() {
   printf "error: %s\n" "$*" >&2
@@ -53,6 +55,8 @@ record_step() {
   local details="$4"
   local status="$5"
   local duration="$6"
+  local kind="${JUST_STEP_REPORT_KIND:-tool}"
+  local extra="${JUST_STEP_REPORT_EXTRA:-}"
 
   JUST_STEP_LABELS+=("$label")
   JUST_STEP_CWDS+=("$(relative_path "$cwd")")
@@ -60,6 +64,82 @@ record_step() {
   JUST_STEP_DETAILS+=("$details")
   JUST_STEP_STATUSES+=("$status")
   JUST_STEP_DURATIONS+=("$duration")
+  JUST_STEP_KINDS+=("$kind")
+  JUST_STEP_EXTRAS+=("$extra")
+}
+
+step_status_label() {
+  local status="$1"
+
+  if [[ "$status" -eq 0 ]]; then
+    printf "passed"
+  else
+    printf "failed(%s)" "$status"
+  fi
+}
+
+print_lint_step_report() {
+  local exit_status="$1"
+  local index
+  local total="${#JUST_STEP_LABELS[@]}"
+  local passed=0
+  local failed=0
+  local status
+  local preflight_count=0
+  local tool_count=0
+
+  [[ "$total" -gt 0 ]] || return "$exit_status"
+
+  for status in "${JUST_STEP_STATUSES[@]}"; do
+    if [[ "$status" -eq 0 ]]; then
+      passed="$((passed + 1))"
+    else
+      failed="$((failed + 1))"
+    fi
+  done
+
+  for ((index = 0; index < total; index++)); do
+    if [[ "${JUST_STEP_KINDS[$index]}" == "preflight" ]]; then
+      preflight_count="$((preflight_count + 1))"
+    else
+      tool_count="$((tool_count + 1))"
+    fi
+  done
+
+  printf "\nCommand summary\n"
+  printf "===============\n"
+  printf "Total: %s, passed: %s, failed: %s\n" "$total" "$passed" "$failed"
+
+  if [[ "$preflight_count" -gt 0 ]]; then
+    printf "\n%-34s  %-10s  %-22s  %s\n" "Check" "Status" "Cwd" "Requirement"
+    printf "%-34s  %-10s  %-22s  %s\n" "-----" "------" "---" "-----------"
+
+    for ((index = 0; index < total; index++)); do
+      [[ "${JUST_STEP_KINDS[$index]}" == "preflight" ]] || continue
+      printf "%-34s  %-10s  %-22s  %s\n" \
+        "${JUST_STEP_LABELS[$index]}" \
+        "$(step_status_label "${JUST_STEP_STATUSES[$index]}")" \
+        "${JUST_STEP_CWDS[$index]}" \
+        "${JUST_STEP_EXTRAS[$index]}"
+    done
+  fi
+
+  if [[ "$tool_count" -gt 0 ]]; then
+    printf "\n%-18s  %-10s  %-22s  %-42s  %s\n" "Linter" "Status" "Cwd" "Cmd" "Files"
+    printf "%-18s  %-10s  %-22s  %-42s  %s\n" "------" "------" "---" "---" "-----"
+
+    for ((index = 0; index < total; index++)); do
+      [[ "${JUST_STEP_KINDS[$index]}" != "preflight" ]] || continue
+      printf "%-18s  %-10s  %-22s  %-42s  %s\n" \
+        "${JUST_STEP_LABELS[$index]}" \
+        "$(step_status_label "${JUST_STEP_STATUSES[$index]}")" \
+        "${JUST_STEP_CWDS[$index]}" \
+        "${JUST_STEP_COMMANDS[$index]}" \
+        "${JUST_STEP_EXTRAS[$index]}"
+    done
+  fi
+
+  return "$exit_status"
 }
 
 print_step_report() {
@@ -71,6 +151,11 @@ print_step_report() {
   local status
 
   [[ "$total" -gt 0 ]] || return "$exit_status"
+
+  if [[ "${JUST_STEP_REPORT_STYLE:-}" == "lint-table" ]]; then
+    print_lint_step_report "$exit_status"
+    return "$exit_status"
+  fi
 
   for status in "${JUST_STEP_STATUSES[@]}"; do
     if [[ "$status" -eq 0 ]]; then
