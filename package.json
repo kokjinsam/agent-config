@@ -1,7 +1,7 @@
 {
   "name": "@kokjinsam/agent-config",
   "version": "1.0.0",
-  "description": "Coding agent commands, skills, extensions, and themes",
+  "description": "Coding agent skills, extensions, and themes",
   "repository": {
     "type": "git",
     "url": "https://github.com/kokjinsam/agent-config.git"
