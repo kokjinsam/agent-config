@@ -1,0 +1,4 @@
+interface:
+  display_name: "Explain Diff"
+  short_description: "Create rich HTML walkthroughs of code changes"
+  default_prompt: "Use $explain-diff to explain the current branch as a self-contained HTML walkthrough."
