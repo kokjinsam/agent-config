@@ -60,11 +60,14 @@ Use simple HTML/CSS diagrams, not ASCII diagrams. Reuse a small number of diagra
 
 Code snippets must use `<pre>` tags. If any custom styled code container is used instead, its CSS must include `white-space: pre` or `white-space: pre-wrap` so newlines are preserved.
 
+Style inline `<code>` and block code separately. Inline `<code>` in prose must have explicit foreground and background colors with at least 4.5:1 contrast; `<pre>` and `pre code` may use a different palette, but block-code rules must not leak into inline code.
+
 ## Verification
 
 Before responding:
 
 - Scan the HTML source and confirm every code block is a `<pre>` tag, or the custom code-block CSS contains `white-space: pre` or `white-space: pre-wrap`.
+- Confirm inline `<code>` and block code are visually readable, with inline `<code>` foreground/background contrast of at least 4.5:1.
 - Confirm the output file path starts with today's `YYYY-MM-DD-` date prefix and is outside the repository.
 - Confirm the table of contents links work, the quiz responds to clicks, and the page has no top-level tabs.
 - If browser tooling is available, open the file and visually check the layout at desktop and mobile widths.
